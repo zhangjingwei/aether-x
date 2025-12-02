@@ -43,7 +43,7 @@ sudo bash install-xray.sh -u
 
 ```bash
 # 查看当前 UUID
-sudo bash install-xray.sh --show-uuid
+sudo bash install-xray.sh -u
 
 # 服务管理
 sudo systemctl start|stop|restart|status xray
