@@ -1,0 +1,33 @@
+# X-Ray-Ops 服务器配置文件示例
+# 复制此文件为 servers.yaml 并修改为你的实际配置
+
+servers:
+  # 服务器配置示例
+  - alias: server-1              # 服务器别名（必填，用于标识服务器）
+    ip: 1.2.3.4                  # 服务器 IP 地址（必填）
+    ssh_port: 22                 # SSH 端口（可选，默认 22）
+    ssh_user: root               # SSH 用户名（可选，默认 root）
+    ssh_key: ~/.ssh/id_rsa       # SSH 私钥路径（可选，如果不使用密钥则通过密码认证）
+    cloud_provider: aws          # 云服务商类型（可选：aws, tencent, gcp, aliyun, custom）
+    region: us-east-1            # 区域（可选）
+    description: "示例服务器"     # 描述（可选）
+    tags:                        # 标签（可选，用于分组管理）
+      - production
+      - us-region
+
+# 全局配置（可选）
+global:
+  default_ssh_user: root
+  default_ssh_port: 22
+  
+  xray:
+    install_path: /usr/local/bin/xray
+    config_path: /usr/local/etc/xray/config.json
+    log_path: /var/log/xray
+    
+  deployment:
+    auto_restart: true
+    enable_bbr: true
+    kernel_tuning: true
+    
+  template: templates/vless-reality.json

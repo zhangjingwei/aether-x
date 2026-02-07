@@ -1,0 +1,21 @@
+# SSH 密钥文件
+keys/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 配置文件中的敏感信息
+configs/servers.yaml
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+*~
