@@ -153,15 +153,16 @@ get_mirror_urls() {
 # 快速检测 URL 是否可达（不下载，只检测连接）
 quick_check_url() {
     local url=$1
-    local timeout=5  # 快速检测，5秒超时
+    local timeout=10  # 快速检测，10秒超时
     
     if command -v wget >/dev/null 2>&1; then
         # 使用 wget --spider 快速检测（不下载文件）
-        if wget --spider --timeout=$timeout --tries=1 "$url" >/dev/null 2>&1; then
+        # 添加 --max-redirect=5 跟随重定向，因为 GitHub 会 302 重定向
+        if wget --spider --timeout=$timeout --tries=1 --max-redirect=5 "$url" >/dev/null 2>&1; then
             return 0
         fi
     elif command -v curl >/dev/null 2>&1; then
-        # 使用 curl -I 快速检测（只获取头部信息）
+        # 使用 curl -I 快速检测（只获取头部信息，-L 跟随重定向）
         if curl -s -I --connect-timeout $timeout --max-time $timeout -L "$url" >/dev/null 2>&1; then
             return 0
         fi
@@ -175,51 +176,37 @@ try_download_from_url() {
     local url=$1
     local output_file=$2
     
-    # 先快速检测连接（3秒超时）
-    if ! quick_check_url "$url"; then
-        return 1  # 连接不可达，立即返回
-    fi
-    
-    # 连接可达，开始下载（使用较短的超时时间）
+    # 直接尝试下载（下载本身有超时控制）
     if command -v wget >/dev/null 2>&1; then
-        # 使用 wget 下载，显示进度
-        # 使用 dot:mega 模式，每下载 1MB 显示一个点
-        # 这样即使通过管道也能看到进度
-        print_info "正在下载（每 MB 显示一个点）..."
-        
-        # 执行下载，过滤并显示进度信息
-        if wget --progress=dot:mega --timeout=15 --tries=1 \
-           -O "$output_file" "$url" 2>&1 | \
-           grep -v "^Resolving\|^Connecting\|^HTTP\|^Length:\|^Saving to" | \
-           grep -E "(\.|saved|MB|KB)" | \
-           while IFS= read -r line; do
-               # 显示进度点或文件大小信息
-               if echo "$line" | grep -qE "\.{10,}"; then
-                   # 显示多个点（表示下载进度）
-                   local dots=$(echo "$line" | grep -o "\.\{1,\}" | wc -l)
-                   printf "下载中%s (%d MB) " "." "$dots"
-               elif echo "$line" | grep -qE "saved|MB|KB"; then
-                   # 显示文件大小信息
-                   echo "$line" | grep -oE "[0-9]+[.][0-9]+[KM]?B|[0-9]+[KM]?B" | head -1
-               fi
-           done; then
-            echo ""  # 换行
+        # 使用 wget 下载，静默模式但显示基本信息
+        print_info "正在下载..."
+        if wget --quiet --show-progress --timeout=300 --tries=1 \
+           -O "$output_file" "$url" 2>&1; then
             # 检查文件是否下载成功
             if [ -f "$output_file" ] && [ -s "$output_file" ]; then
-                return 0
+                local file_size=$(stat -f%z "$output_file" 2>/dev/null || stat -c%s "$output_file" 2>/dev/null || echo 0)
+                if [ "$file_size" -gt 0 ]; then
+                    local size_mb=$(awk "BEGIN {printf \"%.1f\", $file_size / 1048576}")
+                    print_success "下载完成 (${size_mb} MB)"
+                    return 0
+                fi
             fi
         else
-            # 如果管道失败，检查下载是否成功
+            # wget 失败，但检查文件是否已下载（可能进度条导致返回码异常）
             if [ -f "$output_file" ] && [ -s "$output_file" ]; then
-                print_info "下载完成"
-                return 0
+                local file_size=$(stat -f%z "$output_file" 2>/dev/null || stat -c%s "$output_file" 2>/dev/null || echo 0)
+                if [ "$file_size" -gt 19000000 ]; then
+                    local size_mb=$(awk "BEGIN {printf \"%.1f\", $file_size / 1048576}")
+                    print_success "下载完成 (${size_mb} MB)"
+                    return 0
+                fi
             fi
         fi
     elif command -v curl >/dev/null 2>&1; then
         # 使用 curl 显示进度条
         print_info "正在下载..."
-        # curl 的进度条使用 -# 显示
-        if curl -# --connect-timeout 10 --max-time 60 -L \
+        # curl 的进度条使用 -# 显示，增加超时时间到 300 秒
+        if curl -# --connect-timeout 10 --max-time 300 -L \
            -o "$output_file" "$url" 2>&1; then
             echo ""  # 换行
             if [ -f "$output_file" ] && [ -s "$output_file" ]; then
@@ -268,15 +255,6 @@ download_xray() {
         fi
         
         print_info "尝试从 $source_name 下载 ($tried_sources/$total_sources)..."
-        
-        # 快速检测连接（3秒内）
-        print_info "检测连接..."
-        if ! quick_check_url "$url"; then
-            print_warn "$source_name 不可达，立即切换到下一个源..."
-            continue  # 立即跳过，不等待超时
-        fi
-        
-        print_info "连接正常，开始下载..."
         print_info "下载地址: $url"
         
         # 尝试下载
