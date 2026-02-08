@@ -50,6 +50,13 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# DEBUG输出函数（通过环境变量 DEBUG=true 启用）
+debug_log() {
+    if [ "${DEBUG:-false}" = "true" ]; then
+        echo "[DEBUG] $1" >&2
+    fi
+}
+
 print_success() {
     echo -e "${GREEN}[SUCCESS]${NC} $1"
 }
@@ -62,9 +69,9 @@ print_title() {
 
 print_menu_title() {
     echo -e "${CYAN}"
-    echo "╔════════════════════════════════════════╗"
-    echo "║      Aether-X 运维工具主菜单          ║"
-    echo "╚════════════════════════════════════════╝"
+    echo "╔═════════════════════════════════╗"
+    echo "║    Aether-X 运维工具主菜单      ║"
+    echo "╚═════════════════════════════════╝"
     echo -e "${NC}"
 }
 
@@ -730,7 +737,7 @@ Aether-X - Xray-core 自动化部署工具
 这是一个交互式工具，运行后会显示菜单，您可以选择：
   [1] 批量部署远程节点 - 选择要部署的服务器
   [2] 检查所有节点在线状态
-  [3] 健康检查（TCP/ICMP/IP封锁检测）
+  [3] 健康检查（TCP/ICMP/应用层检测）
   [4] 生成订阅链接
   [5] 批量卸载远程节点 - 选择要卸载的服务器
   [0] 退出
@@ -749,7 +756,7 @@ show_menu() {
     echo ""
     echo -e "  ${CYAN}[1]${NC} 批量部署远程节点"
     echo -e "  ${CYAN}[2]${NC} 检查所有节点在线状态"
-    echo -e "  ${CYAN}[3]${NC} 健康检查（TCP/ICMP/IP封锁检测）"
+    echo -e "  ${CYAN}[3]${NC} 健康检查（TCP/ICMP/应用层检测）"
     echo -e "  ${CYAN}[4]${NC} 生成订阅链接"
     echo -e "  ${CYAN}[5]${NC} 批量卸载远程节点"
     echo -e "  ${CYAN}[0]${NC} 退出"
@@ -800,6 +807,9 @@ menu_check_status() {
     
     local config_file="${CONFIG_FILE:-$SCRIPT_DIR/configs/servers.yaml}"
     
+    debug_log "menu_check_status 开始执行"
+    debug_log "config_file: $config_file"
+    
     if [ ! -f "$config_file" ]; then
         print_error "配置文件不存在: $config_file"
         return 1
@@ -807,14 +817,22 @@ menu_check_status() {
     
     # 加载模块
     load_module "multi_server"
+    debug_log "模块加载完成"
     
     # 执行状态检查
+    debug_log "准备调用 batch_check_status"
     batch_check_status "$config_file"
+    local check_exit=$?
+    debug_log "batch_check_status 返回码: $check_exit"
+    
+    # 确保函数正常返回
+    debug_log "menu_check_status 准备返回"
+    return 0
 }
 
 # 选项4: 健康检查
 menu_health_check() {
-    print_title "健康检查（TCP/ICMP/IP封锁检测）"
+    print_title "健康检查（TCP/ICMP/应用层检测）"
     
     local config_file="${CONFIG_FILE:-$SCRIPT_DIR/configs/servers.yaml}"
     
@@ -835,7 +853,7 @@ menu_generate_subscription() {
     print_title "生成订阅链接"
     
     local config_file="${CONFIG_FILE:-$SCRIPT_DIR/configs/servers.yaml}"
-    local check_log="${SCRIPT_DIR}/logs/last_check.log"
+    local log_dir="${SCRIPT_DIR}/logs"
     
     if [ ! -f "$config_file" ]; then
         print_error "配置文件不存在: $config_file"
@@ -845,15 +863,64 @@ menu_generate_subscription() {
     # 加载模块
     load_module "sub_manager"
     
-    # 检查是否有健康检查日志
-    if [ ! -f "$check_log" ]; then
-        print_warn "健康检查日志不存在，将使用所有节点"
+    # 查找可用的健康检查日志
+    local check_log=""
+    local log_files=()
+    
+    if [ -d "$log_dir" ]; then
+        # 查找所有检查日志文件（按时间倒序）
+        while IFS= read -r -d '' file; do
+            log_files+=("$file")
+        done < <(find "$log_dir" -maxdepth 1 -name "check_*.log" -type f -print0 2>/dev/null | sort -z -r)
+        
+        # 也检查符号链接
+        if [ -L "$log_dir/last_check.log" ]; then
+            local linked_file=$(readlink -f "$log_dir/last_check.log" 2>/dev/null)
+            if [ -f "$linked_file" ]; then
+                check_log="$linked_file"
+            fi
+        elif [ -f "$log_dir/last_check.log" ]; then
+            check_log="$log_dir/last_check.log"
+        fi
+    fi
+    
+    # 如果没有找到日志，让用户选择
+    if [ -z "$check_log" ] && [ ${#log_files[@]} -eq 0 ]; then
+        print_warn "未找到健康检查日志，将使用所有节点"
         echo -ne "${YELLOW}是否继续？[y/N]: ${NC}"
         read -r confirm
         if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
             print_info "已取消"
             return 0
         fi
+        check_log=""
+    elif [ ${#log_files[@]} -gt 1 ]; then
+        # 有多个日志文件，让用户选择
+        echo ""
+        echo -e "${CYAN}发现多个健康检查日志，请选择:${NC}"
+        echo "  [0] 使用最新日志（推荐）"
+        local idx=1
+        for log_file in "${log_files[@]:0:10}"; do
+            local file_name=$(basename "$log_file")
+            local file_time=$(stat -c "%y" "$log_file" 2>/dev/null | cut -d'.' -f1 || stat -f "%Sm" "$log_file" 2>/dev/null | cut -d'.' -f1 || echo "未知时间")
+            echo "  [$idx] $file_name ($file_time)"
+            ((idx++))
+        done
+        echo ""
+        echo -ne "${YELLOW}请选择 [0-$((idx-1))]: ${NC}"
+        read -r log_choice
+        
+        if [ "$log_choice" = "0" ]; then
+            check_log="${log_files[0]}"
+        elif [ "$log_choice" -ge 1 ] && [ "$log_choice" -lt "$idx" ]; then
+            check_log="${log_files[$((log_choice-1))]}"
+        else
+            print_error "无效选择"
+            return 1
+        fi
+    elif [ ${#log_files[@]} -eq 1 ]; then
+        # 只有一个日志文件，直接使用
+        check_log="${log_files[0]}"
     fi
     
     # 询问是否分发
@@ -896,8 +963,8 @@ menu_generate_subscription() {
             ;;
     esac
     
-    # 执行生成和分发
-    generate_and_distribute_subscription "$config_file" "$check_log" "$dist_method" "$dist_config"
+    # 执行生成和分发（如果 check_log 为空，传递空字符串）
+    generate_and_distribute_subscription "$config_file" "${check_log:-}" "$dist_method" "$dist_config"
 }
 
 # 选项5: 批量卸载远程节点
@@ -1106,10 +1173,15 @@ main() {
                 read -r
                 ;;
             2)
+                debug_log "菜单选项2被选择"
                 menu_check_status
+                local menu_exit=$?
+                debug_log "menu_check_status 返回码: $menu_exit"
                 echo ""
                 echo -ne "${YELLOW}按 Enter 键返回菜单...${NC}"
+                debug_log "准备等待用户输入"
                 read -r
+                debug_log "用户已按回车，准备返回菜单"
                 ;;
             3)
                 menu_health_check

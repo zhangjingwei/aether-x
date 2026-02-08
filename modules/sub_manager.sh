@@ -38,7 +38,6 @@ fi
 # 全局变量
 DIST_DIR="dist"
 LOG_DIR="logs"
-LAST_CHECK_LOG="$LOG_DIR/last_check.log"
 SUBSCRIPTION_BASE_DIR="$DIST_DIR"
 DEFAULT_XRAY_PORT=443
 
@@ -205,6 +204,60 @@ get_remote_xray_config() {
     return 0
 }
 
+# 从远程服务器拉取info文件到本地
+fetch_remote_info_file() {
+    local node_alias=$1
+    local ip=$2
+    local ssh_port=$3
+    local ssh_user=$4
+    local ssh_key=$5
+    local config_dir="configs"
+    
+    local remote_info_path="/usr/local/etc/xray/config.info"
+    local local_info_file="$config_dir/${node_alias}.info"
+    
+    # 构建SSH命令
+    local ssh_cmd=$(build_ssh_cmd "$ip" "$ssh_port" "$ssh_user" "$ssh_key")
+    
+    # 检查远程info文件是否存在
+    if ! timeout 5 $ssh_cmd "test -f $remote_info_path" >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    # 构建SCP命令
+    local scp_cmd="scp -P $ssh_port"
+    scp_cmd="$scp_cmd -o StrictHostKeyChecking=no"
+    scp_cmd="$scp_cmd -o ConnectTimeout=10"
+    scp_cmd="$scp_cmd -o BatchMode=yes"
+    scp_cmd="$scp_cmd -o UserKnownHostsFile=/dev/null"
+    
+    if [ -n "$ssh_key" ]; then
+        ssh_key=$(echo "$ssh_key" | sed "s|^~|$HOME|")
+        if [ -f "$ssh_key" ]; then
+            scp_cmd="$scp_cmd -i $ssh_key"
+        fi
+    fi
+    
+    # 确保本地configs目录存在
+    mkdir -p "$config_dir"
+    
+    # 从远程拉取info文件
+    if $scp_cmd "$ssh_user@$ip:$remote_info_path" "$local_info_file" >/dev/null 2>&1; then
+        # 在info文件开头添加服务器别名，方便后续查找
+        if ! grep -q "服务器别名\|Server Alias\|Alias:" "$local_info_file" 2>/dev/null; then
+            # 在文件开头添加别名信息
+            local temp_file=$(mktemp)
+            echo "# 服务器别名: $node_alias" > "$temp_file"
+            cat "$local_info_file" >> "$temp_file"
+            mv "$temp_file" "$local_info_file"
+        fi
+        print_info "已从服务端拉取info文件: $node_alias"
+        return 0
+    else
+        return 1
+    fi
+}
+
 # 从本地info文件读取配置信息
 get_local_config_info() {
     local alias=$1
@@ -337,8 +390,6 @@ generate_subscription() {
     local check_log=$2
     local output_file=$3
     
-    print_title "生成订阅链接"
-    
     if [ ! -f "$yaml_file" ]; then
         print_error "配置文件不存在: $yaml_file"
         return 1
@@ -451,7 +502,19 @@ generate_subscription() {
         # 方法1: 从本地info文件读取
         config_info=$(get_local_config_info "$node_alias")
         
-        # 方法2: 从远程服务器读取
+        # 方法2: 如果本地没有，从服务端拉取info文件
+        if [ -z "$config_info" ] || echo "$config_info" | grep -q "^|"; then
+            local ssh_cmd=$(build_ssh_cmd "$ip" "$ssh_port" "$ssh_user" "$ssh_key")
+            if timeout 5 $ssh_cmd "echo test" >/dev/null 2>&1; then
+                # 尝试从服务端拉取info文件
+                if fetch_remote_info_file "$node_alias" "$ip" "$ssh_port" "$ssh_user" "$ssh_key"; then
+                    # 拉取成功后，再次尝试从本地读取
+                    config_info=$(get_local_config_info "$node_alias")
+                fi
+            fi
+        fi
+        
+        # 方法3: 如果仍然没有，从远程服务器读取配置文件
         if [ -z "$config_info" ] || echo "$config_info" | grep -q "^|"; then
             local ssh_cmd=$(build_ssh_cmd "$ip" "$ssh_port" "$ssh_user" "$ssh_key")
             if timeout 5 $ssh_cmd "echo test" >/dev/null 2>&1; then
@@ -681,11 +744,9 @@ distribute_to_vps() {
 # 主函数：生成并分发订阅
 generate_and_distribute_subscription() {
     local yaml_file=$1
-    local check_log=${2:-"$LAST_CHECK_LOG"}
+    local check_log=${2:-""}
     local distribution_method=${3:-""}
     local distribution_config=${4:-""}
-    
-    print_title "订阅管理"
     
     # 生成随机文件名
     local random_filename=$(generate_random_filename "sub" "txt")
@@ -770,5 +831,5 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
         exit 1
     fi
     
-    generate_and_distribute_subscription "$1" "${2:-$LAST_CHECK_LOG}" "$3" "$4"
+    generate_and_distribute_subscription "$1" "${2:-}" "$3" "$4"
 fi

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 健康检查模块
-# 针对多节点环境的健康监测工具，支持TCP/ICMP/应用层检测和IP封锁检测
+# 针对多节点环境的健康监测工具，支持TCP/ICMP/应用层检测
 
 # 颜色定义（如果未定义）
 if [ -z "${RED}" ]; then
@@ -41,7 +41,6 @@ PING_COUNT=4
 PING_TIMEOUT=3
 DEFAULT_XRAY_PORT=443
 LOG_DIR="logs"
-LAST_CHECK_LOG="$LOG_DIR/last_check.log"
 TEMP_DIR=$(mktemp -d)
 CHECK_RESULTS=()
 
@@ -189,20 +188,13 @@ check_tcp_port() {
     local port=$2
     local timeout=${3:-$HEALTH_CHECK_TIMEOUT}
     
-    # 使用timeout和nc/telnet/bash内置的TCP连接
-    if command -v nc >/dev/null 2>&1; then
-        if timeout "$timeout" nc -z -w "$timeout" "$ip" "$port" >/dev/null 2>&1; then
-            return 0
-        fi
-    elif command -v telnet >/dev/null 2>&1; then
-        if timeout "$timeout" bash -c "echo > /dev/tcp/$ip/$port" >/dev/null 2>&1; then
-            return 0
-        fi
-    else
-        # 使用bash内置TCP连接
-        if timeout "$timeout" bash -c "echo > /dev/tcp/$ip/$port" >/dev/null 2>&1; then
-            return 0
-        fi
+    # 使用nc进行TCP连接检测
+    if ! command -v nc >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    if timeout "$timeout" nc -z -w "$timeout" "$ip" "$port" >/dev/null 2>&1; then
+        return 0
     fi
     
     return 1
@@ -214,33 +206,28 @@ check_icmp() {
     local count=${2:-$PING_COUNT}
     local timeout=${3:-$PING_TIMEOUT}
     
-    local ping_result=""
-    local avg_latency=""
-    local packet_loss=""
-    
-    if command -v ping >/dev/null 2>&1; then
-        # Linux ping
-        if ping -c "$count" -W "$timeout" "$ip" >/dev/null 2>&1; then
-            ping_result=$(ping -c "$count" -W "$timeout" "$ip" 2>/dev/null)
-            avg_latency=$(echo "$ping_result" | grep -oP 'min/avg/max/[^=]*=\s*\K[0-9.]+' | cut -d'/' -f2 2>/dev/null)
-            packet_loss=$(echo "$ping_result" | grep -oP '[0-9]+% packet loss' | grep -oP '[0-9]+' | head -1)
-            
-            if [ -z "$avg_latency" ]; then
-                # 尝试另一种格式
-                avg_latency=$(echo "$ping_result" | grep -oP 'rtt min/avg/max = [^/]+/([^/]+)/' | cut -d'/' -f2)
-            fi
-            
-            if [ -z "$packet_loss" ]; then
-                packet_loss=0
-            fi
-            
-            echo "${avg_latency:-0}|${packet_loss:-0}"
-            return 0
-        fi
+    if ! command -v ping >/dev/null 2>&1; then
+        echo "0|100"
+        return 1
     fi
     
-    echo "0|100"
-    return 1
+    # 执行ping检测
+    if ! ping -c "$count" -W "$timeout" "$ip" >/dev/null 2>&1; then
+        echo "0|100"
+        return 1
+    fi
+    
+    # 解析ping结果
+    local ping_result=$(ping -c "$count" -W "$timeout" "$ip" 2>/dev/null)
+    local avg_latency=$(echo "$ping_result" | grep -oP 'min/avg/max/[^=]*=\s*\K[0-9.]+' | cut -d'/' -f2 2>/dev/null)
+    local packet_loss=$(echo "$ping_result" | grep -oP '[0-9]+% packet loss' | grep -oP '[0-9]+' | head -1)
+    
+    # 使用默认值
+    avg_latency=${avg_latency:-0}
+    packet_loss=${packet_loss:-0}
+    
+    echo "${avg_latency}|${packet_loss}"
+    return 0
 }
 
 # 应用层检测：尝试简单的TLS握手（可选）
@@ -258,83 +245,6 @@ check_application_layer() {
     
     # 如果openssl不可用，返回TCP检查结果
     return 1
-}
-
-# IP封锁检测（GFW Check）
-check_ip_blocked() {
-    local ip=$1
-    
-    # 方法1: 使用check-host.net API（免费，无需API key）
-    if command -v curl >/dev/null 2>&1; then
-        # 使用check-host.net的API
-        local api_url="https://check-host.net/check-tcp?host=${ip}:443&max_nodes=5"
-        local response=$(curl -s -m 10 "$api_url" 2>/dev/null)
-        
-        if [ -n "$response" ] && echo "$response" | grep -q "request_id"; then
-            # 获取request_id
-            local request_id=$(echo "$response" | grep -o '"request_id":"[^"]*"' | cut -d'"' -f4 | head -1)
-            
-            if [ -n "$request_id" ]; then
-                # 等待一下让检查完成
-                sleep 2
-                
-                # 获取结果
-                local result_url="https://check-host.net/check-result/${request_id}"
-                local result=$(curl -s -m 10 "$result_url" 2>/dev/null)
-                
-                if [ -n "$result" ]; then
-                    # 解析结果，统计成功和失败的节点
-                    local success_count=0
-                    local total_count=0
-                    
-                    # 解析JSON结果（简单解析）
-                    echo "$result" | grep -o '"[^"]*":\[[^]]*\]' | while IFS= read -r node_result; do
-                        ((total_count++))
-                        if echo "$node_result" | grep -q '"Ok"\|"OK"'; then
-                            ((success_count++))
-                        fi
-                    done
-                    
-                    # 如果解析成功
-                    if [ "$total_count" -gt 0 ]; then
-                        local success_rate=$((success_count * 100 / total_count))
-                        
-                        if [ "$success_rate" -lt 50 ]; then
-                            echo "BLOCKED|$success_rate"
-                            return 1
-                        elif [ "$success_rate" -lt 80 ]; then
-                            echo "PARTIAL|$success_rate"
-                            return 0
-                        else
-                            echo "OK|$success_rate"
-                            return 0
-                        fi
-                    fi
-                fi
-            fi
-        fi
-    fi
-    
-    # 方法2: 简单的延迟判断（如果check-host.net不可用）
-    # 使用ICMP延迟来判断是否可能被封锁
-    local local_ping=$(check_icmp "$ip" 2 2)
-    local local_latency=$(echo "$local_ping" | cut -d'|' -f1)
-    local local_loss=$(echo "$local_ping" | cut -d'|' -f2)
-    
-    if [ -z "$local_latency" ] || [ "$local_latency" = "0" ] || [ "$local_loss" = "100" ]; then
-        echo "UNKNOWN|0"
-        return 2
-    fi
-    
-    # 如果本地延迟异常高（>500ms）或丢包率高（>50%），可能是被封锁
-    # 使用awk进行浮点数比较（不依赖bc）
-    if echo "$local_latency" | awk '{exit !($1 > 500)}' 2>/dev/null || [ "$local_loss" -gt 50 ]; then
-        echo "SUSPECTED|${local_latency}ms/${local_loss}%"
-        return 1
-    else
-        echo "OK|${local_latency}ms"
-        return 0
-    fi
 }
 
 # 检查单个服务器的健康状态
@@ -355,8 +265,6 @@ check_single_server() {
     local icmp_latency="0"
     local icmp_loss="100"
     local app_status="N/A"
-    local ip_status="UNKNOWN"
-    local ip_status_detail=""
     local overall_status="FAIL"
     
     # 检查并修复 SSH 密钥权限（WSL 环境特殊处理）
@@ -399,20 +307,9 @@ check_single_server() {
         app_status="SKIP"
     fi
     
-    # IP封锁检测
-    local block_result=$(check_ip_blocked "$ip")
-    ip_status=$(echo "$block_result" | cut -d'|' -f1)
-    ip_status_detail=$(echo "$block_result" | cut -d'|' -f2)
-    
     # 判断整体状态
     if [ "$tcp_status" = "OK" ] && [ "$icmp_loss" -lt 50 ]; then
-        if [ "$ip_status" = "OK" ] || [ "$ip_status" = "PARTIAL" ]; then
-            overall_status="OK"
-        elif [ "$ip_status" = "SUSPECTED" ]; then
-            overall_status="WARN"
-        else
-            overall_status="WARN"
-        fi
+        overall_status="OK"
     elif [ "$tcp_status" = "OK" ]; then
         overall_status="WARN"
     else
@@ -432,8 +329,6 @@ tcp_port=$tcp_port
 icmp_latency=$icmp_latency
 icmp_loss=$icmp_loss
 app_status=$app_status
-ip_status=$ip_status
-ip_status_detail=$ip_status_detail
 overall_status=$overall_status
 duration=$duration
 EOF
@@ -471,30 +366,6 @@ format_status() {
     esac
 }
 
-# 格式化IP状态显示
-format_ip_status() {
-    local status=$1
-    local detail=$2
-    
-    case "$status" in
-        OK)
-            echo -e "${GREEN}正常${NC}"
-            ;;
-        PARTIAL)
-            echo -e "${YELLOW}部分封锁(${detail}%)${NC}"
-            ;;
-        BLOCKED)
-            echo -e "${RED}已封锁(${detail}%)${NC}"
-            ;;
-        SUSPECTED)
-            echo -e "${YELLOW}疑似封锁${NC}"
-            ;;
-        *)
-            echo -e "${CYAN}未知${NC}"
-            ;;
-    esac
-}
-
 # 生成健康检查报告表格
 generate_health_report() {
     local result_files=("$@")
@@ -502,9 +373,9 @@ generate_health_report() {
     print_title "健康检查报告"
     
     # 表头
-    printf "%-20s %-15s %-8s %-12s %-10s %-20s\n" \
-        "节点别名" "云厂商" "状态" "延迟" "丢包率" "IP状态"
-    echo "--------------------------------------------------------------------------------"
+    printf "%-20s %-15s %-8s %-12s %-10s\n" \
+        "节点别名" "云厂商" "状态" "延迟" "丢包率"
+    echo "----------------------------------------------------------------------"
     
     local ok_count=0
     local warn_count=0
@@ -525,8 +396,6 @@ generate_health_report() {
         local file_overall_status=""
         local file_icmp_latency=""
         local file_icmp_loss=""
-        local file_ip_status=""
-        local file_ip_status_detail=""
         
         # 在主 shell 中 source，立即保存变量
         if ! source "$result_file" 2>/dev/null; then
@@ -539,13 +408,11 @@ generate_health_report() {
         file_overall_status="$overall_status"
         file_icmp_latency="$icmp_latency"
         file_icmp_loss="$icmp_loss"
-        file_ip_status="$ip_status"
-        file_ip_status_detail="$ip_status_detail"
         
         # 清空全局变量，避免影响下次循环
         # 使用 set +e 临时禁用错误退出，防止 unset 失败导致脚本退出
         set +e
-        unset alias cloud_provider overall_status icmp_latency icmp_loss ip_status ip_status_detail 2>/dev/null || true
+        unset alias cloud_provider overall_status icmp_latency icmp_loss 2>/dev/null || true
         set -e
         
         # 检查必要变量是否存在
@@ -557,7 +424,6 @@ generate_health_report() {
         local status_display=$(format_status "$file_overall_status")
         local latency_display=$(format_latency "$file_icmp_latency")
         local loss_display="${file_icmp_loss}%"
-        local ip_status_display=$(format_ip_status "$file_ip_status" "$file_ip_status_detail")
         
         # 根据状态设置颜色
         local alias_color=""
@@ -571,13 +437,12 @@ generate_health_report() {
         
         # 使用 set +e 临时禁用错误退出，防止 printf 失败导致脚本退出
         set +e
-        printf "${alias_color}%-20s${NC} %-15s %-8s %-12s %-10s %-20s\n" \
+        printf "${alias_color}%-20s${NC} %-15s %-8s %-12s %-10s\n" \
             "$file_alias" \
             "${file_cloud_provider:-N/A}" \
             "$status_display" \
             "$latency_display" \
-            "$loss_display" \
-            "$ip_status_display" || true
+            "$loss_display" || true
         set -e
         
         # 统计（使用 set +e 防止算术表达式失败）
@@ -603,10 +468,12 @@ generate_health_report() {
     echo ""
 }
 
-# 保存检查结果到日志
+# 保存检查结果到日志（按时间戳保存）
 save_check_log() {
     local result_files=("$@")
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp_file=$(date '+%Y%m%d_%H%M%S')
+    local log_file="$LOG_DIR/check_${timestamp_file}.log"
     
     {
         echo "=========================================="
@@ -628,14 +495,18 @@ save_check_log() {
             echo "  ICMP延迟: ${icmp_latency}ms"
             echo "  ICMP丢包: ${icmp_loss}%"
             echo "  应用层: $app_status"
-            echo "  IP状态: $ip_status ($ip_status_detail)"
             echo "  整体状态: $overall_status"
             echo "  检查耗时: ${duration}秒"
             echo ""
         done
-    } > "$LAST_CHECK_LOG"
+    } > "$log_file"
     
-    print_info "检查结果已保存到: $LAST_CHECK_LOG"
+    # 同时创建符号链接指向最新日志（方便查找）
+    local latest_log="$LOG_DIR/last_check.log"
+    ln -sf "$(basename "$log_file")" "$latest_log" 2>/dev/null || true
+    
+    print_info "检查结果已保存到: $log_file"
+    print_info "最新日志链接: $latest_log"
 }
 
 # 批量健康检查（主函数）
@@ -643,8 +514,6 @@ batch_health_check() {
     local yaml_file=$1
     local parallel_mode=${2:-true}
     local max_parallel=${3:-10}
-    
-    print_title "开始健康检查"
     
     if [ ! -f "$yaml_file" ]; then
         print_error "配置文件不存在: $yaml_file"
@@ -760,8 +629,6 @@ batch_health_check() {
                 echo "icmp_latency=0"
                 echo "icmp_loss=100"
                 echo "app_status=SKIP"
-                echo "ip_status=UNKNOWN"
-                echo "ip_status_detail="
                 echo "overall_status=FAIL"
                 echo "duration=0"
             } > "$result_file_path" 2>&1

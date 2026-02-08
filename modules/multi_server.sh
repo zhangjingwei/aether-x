@@ -35,6 +35,13 @@ if ! declare -f print_info >/dev/null; then
     }
 fi
 
+# DEBUG输出函数（通过环境变量 DEBUG=true 启用）
+debug_log() {
+    if [ "${DEBUG:-false}" = "true" ]; then
+        echo "[DEBUG] $1" >&2
+    fi
+}
+
 # 全局变量
 REMOTE_MODULES_DIR="/tmp/xray_ops"
 DEPLOY_RESULTS_FILE=""
@@ -246,6 +253,10 @@ if declare -f generate_vless_reality_grpc_config >/dev/null 2>&1; then
     generate_vless_reality_grpc_config \"\$SERVER_IP\" 443 \"/usr/local/etc/xray/config.json\" \"\" \"/usr/local/bin/xray\" >/dev/null 2>&1
     if [ \$? -eq 0 ] && [ -f \"/usr/local/etc/xray/config.json\" ] && [ -s \"/usr/local/etc/xray/config.json\" ]; then
         chmod 644 /usr/local/etc/xray/config.json
+        # 确保 info 文件也保存到配置目录（generate_server_config会自动生成）
+        if [ -f \"/usr/local/etc/xray/config.info\" ]; then
+            chmod 644 /usr/local/etc/xray/config.info
+        fi
         exit 0
     else
         echo \"ERROR: 配置文件生成失败或文件为空\" >&2
@@ -346,7 +357,7 @@ deploy_single_server() {
     
     # 0. 网络预检（ping 检查）
     if command -v ping >/dev/null 2>&1; then
-        if ! ping -c 1 -W 2 "$server_ip" >/dev/null 2>&1 && ! ping -c 1 -w 2000 "$server_ip" >/dev/null 2>&1; then
+        if ! ping -c 1 -W 2 "$server_ip" >/dev/null 2>&1; then
             print_error "服务器 $server_ip 网络不可达（ping 失败），跳过部署"
             if [ -n "${DEPLOY_RESULTS_FILE:-}" ] && [ -f "${DEPLOY_RESULTS_FILE:-}" ]; then
                 echo "$server_alias|FAILED|网络不可达(ping失败)|$(( $(date +%s) - start_time ))秒" >> "$DEPLOY_RESULTS_FILE"
@@ -483,8 +494,6 @@ batch_deploy() {
     local parallel_mode=${4:-false}
     local max_parallel=${5:-5}
     
-    print_title "批量部署 Xray-core"
-    
     if [ ! -f "$yaml_file" ]; then
         print_error "配置文件不存在: $yaml_file"
         return 1
@@ -529,29 +538,7 @@ batch_deploy() {
         return 1
     fi
     
-    # 准备配置文件列表（现在主要在服务器上生成，本地生成作为备用）
-    local temp_dir=$(mktemp -d)
-    local config_files=()
-    
-    print_info "准备配置文件..."
-    print_info "注意: 配置文件将在服务器上自动生成（使用已安装的 Xray）"
-    print_info "本地生成仅作为备用方案"
-    echo ""
-    
-    # 为每台服务器准备配置记录（即使不生成，也记录以便后续处理）
-    echo "$servers" | while IFS= read -r server_json; do
-        [ -z "$server_json" ] || [ "$server_json" = "null" ] && continue
-        
-        local alias=$(extract_server_field "$server_json" "alias")
-        local ip=$(extract_server_field "$server_json" "ip")
-        
-        if [ -z "$alias" ] || [ -z "$ip" ]; then
-            continue
-        fi
-        
-        # 记录空路径，表示将在服务器上生成
-        config_files+=("|$alias")
-    done
+    # 配置文件在服务器上自动生成，无需本地准备
     
     # 创建结果文件
     DEPLOY_RESULTS_FILE=$(mktemp)
@@ -584,22 +571,8 @@ batch_deploy() {
             continue
         fi
         
-        # 查找对应的配置文件
+        # 配置文件在服务器上生成，本地不需要
         local config_file=""
-        for config_entry in "${config_files[@]}"; do
-            if echo "$config_entry" | grep -q "|$alias$"; then
-                config_file=$(echo "$config_entry" | cut -d'|' -f1)
-                # 检查配置文件是否有效（不为空且文件存在）
-                if [ -n "$config_file" ] && [ -f "$config_file" ] && [ -s "$config_file" ]; then
-                    print_info "[$alias] 找到配置文件: $config_file"
-                    break
-                else
-                    print_warn "[$alias] 配置文件未生成或无效，将跳过步骤 4"
-                    config_file=""  # 清空，确保后续步骤知道没有配置文件
-                    break
-                fi
-            fi
-        done
         
         # 执行部署
         if [ "$parallel_mode" = "true" ]; then
@@ -633,8 +606,6 @@ batch_deploy() {
         done
     fi
     
-    # 清理临时文件
-    rm -rf "$temp_dir"
     
     # 显示部署结果汇总
     print_title "部署结果汇总"
@@ -683,57 +654,116 @@ batch_deploy() {
 batch_check_status() {
     local yaml_file=$1
     
-    print_title "检查所有服务器状态"
+    debug_log "batch_check_status 开始执行，yaml_file: $yaml_file"
     
     if [ ! -f "$yaml_file" ]; then
+        debug_log "配置文件不存在"
         print_error "配置文件不存在: $yaml_file"
         return 1
     fi
     
+    debug_log "配置文件存在，检查 yq 命令"
     if ! command -v yq >/dev/null 2>&1; then
+        debug_log "yq 命令不存在"
         print_error "需要安装 yq 工具来解析 YAML 配置"
         return 1
     fi
     
+    debug_log "yq 命令存在，开始解析服务器配置"
     local servers=$(parse_server_config "$yaml_file")
+    debug_log "parse_server_config 返回结果长度: ${#servers}"
+    
+    if [ -z "$servers" ]; then
+        debug_log "未找到服务器配置"
+        print_error "未找到服务器配置"
+        return 1
+    fi
+    
+    debug_log "找到服务器配置，开始处理"
+    
     local online_count=0
     local offline_count=0
+    local server_count=0
     
-    echo "$servers" | while IFS= read -r server_json; do
-        [ -z "$server_json" ] || [ "$server_json" = "null" ] && continue
+    debug_log "初始化计数器，开始循环处理服务器"
+    # 使用进程替换避免子shell问题
+    while IFS= read -r server_json; do
+        debug_log "读取到服务器JSON: ${server_json:0:50}..."
+        debug_log "检查JSON是否为空或null..."
+        if [ -z "$server_json" ] || [ "$server_json" = "null" ]; then
+            debug_log "JSON为空或null，跳过"
+            continue
+        fi
+        debug_log "JSON有效，继续处理"
         
+        debug_log "准备增加服务器计数，当前值: $server_count"
+        set +e  # 临时禁用错误退出
+        ((server_count++)) 2>/dev/null || true
+        set -e  # 重新启用错误退出
+        debug_log "服务器计数增加完成，新值: $server_count"
+        debug_log "处理第 $server_count 台服务器"
+        
+        debug_log "开始提取字段..."
         local alias=$(extract_server_field "$server_json" "alias")
+        debug_log "alias提取完成: $alias"
         local ip=$(extract_server_field "$server_json" "ip")
+        debug_log "ip提取完成: $ip"
         local ssh_port=$(extract_server_field "$server_json" "ssh_port")
+        debug_log "ssh_port提取完成: $ssh_port"
         local ssh_user=$(extract_server_field "$server_json" "ssh_user")
+        debug_log "ssh_user提取完成: $ssh_user"
         local ssh_key=$(extract_server_field "$server_json" "ssh_key")
+        debug_log "ssh_key提取完成"
+        
+        debug_log "所有字段提取完成: alias=$alias, ip=$ip, ssh_port=$ssh_port, ssh_user=$ssh_user"
         
         ssh_port=${ssh_port:-22}
         ssh_user=${ssh_user:-root}
         
         if [ -z "$alias" ] || [ -z "$ip" ]; then
+            debug_log "alias或ip为空，跳过"
             continue
         fi
         
+        debug_log "构建SSH命令"
         local ssh_cmd=$(build_ssh_cmd "$ip" "$ssh_port" "$ssh_user" "$ssh_key")
         
         # 检查 SSH 连接
+        debug_log "检查SSH连接: $alias"
         if ! timeout 5 $ssh_cmd "echo 'test'" >/dev/null 2>&1; then
             print_error "[$alias] SSH 连接失败"
-            ((offline_count++))
+            set +e
+            ((offline_count++)) 2>/dev/null || true
+            set -e
+            debug_log "SSH连接失败，离线数: $offline_count"
             continue
         fi
         
+        debug_log "SSH连接成功，检查Xray服务状态"
         # 检查 Xray 服务状态
         if $ssh_cmd "systemctl is-active --quiet xray" 2>/dev/null; then
             local version=$($ssh_cmd "/usr/local/bin/xray version 2>/dev/null | head -1" || echo "unknown")
             print_success "[$alias] Xray 服务运行中 - $version"
-            ((online_count++))
+            set +e
+            ((online_count++)) 2>/dev/null || true
+            set -e
+            debug_log "Xray服务运行中，在线数: $online_count"
         else
             print_warn "[$alias] Xray 服务未运行"
-            ((offline_count++))
+            set +e
+            ((offline_count++)) 2>/dev/null || true
+            set -e
+            debug_log "Xray服务未运行，离线数: $offline_count"
         fi
-    done
+        debug_log "完成处理服务器: $alias"
+    done <<< "$servers"
+    
+    debug_log "循环结束"
+    
+    # 调试信息
+    debug_log "处理服务器数量: $server_count"
+    debug_log "在线数量: $online_count"
+    debug_log "离线数量: $offline_count"
     
     echo ""
     print_title "状态统计"
@@ -741,6 +771,9 @@ batch_check_status() {
     if [ $offline_count -gt 0 ]; then
         print_warn "离线: $offline_count 台"
     fi
+    
+    debug_log "batch_check_status 函数执行完成，准备返回"
+    return 0
 }
 
 # 远程卸载单台服务器
@@ -811,8 +844,6 @@ batch_uninstall() {
     local selected_alias=${3:-""}
     local parallel_mode=${4:-false}
     local max_parallel=${5:-5}
-    
-    print_title "批量卸载 Xray-core"
     
     if [ ! -f "$yaml_file" ]; then
         print_error "配置文件不存在: $yaml_file"

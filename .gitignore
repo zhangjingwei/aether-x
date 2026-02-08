@@ -7,6 +7,7 @@ keys/
 
 # 配置文件中的敏感信息
 configs/servers.yaml
+configs/*.info
 
 # 系统文件
 .DS_Store
@@ -19,3 +20,4 @@ Thumbs.db
 *.tmp
 *.bak
 *~
+dist/

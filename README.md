@@ -39,7 +39,7 @@ Aether-X 采用 Controller-Node 架构模式，通过 SSH 协议实现集中式�
 - **控制端（Control Plane）**：运行 `main.sh` 的本地/管理服务器，负责读取配置、连接远程节点、执行部署和监控
 - **节点（Data Plane）**：远程 VPS 服务器，运行 Xray-core 服务，支持 x86_64 和 ARM64 架构
 - **安全通道**：SSH（端口可配置）+ 密钥认证
-- **健康监测**：三维检测体系（TCP/ICMP/应用层）+ IP 封锁检测 + 实时故障自愈
+- **健康监测**：三维检测体系（TCP/ICMP/应用层）+ 实时故障自愈
 - **订阅分发**：智能订阅生成（仅包含健康节点），支持 S3/GitHub Pages/VPS 分发
 
 ## 核心特性
@@ -50,7 +50,6 @@ Aether-X 采用 Controller-Node 架构模式，通过 SSH 协议实现集中式�
   - **TCP 层**：端口连通性检测（443/自定义端口）
   - **ICMP 层**：延迟与丢包率监控
   - **应用层**：TLS 握手验证
-- **IP 封锁检测**：通过多点 API 检测 GFW 封锁状态
 - **自动故障隔离**：失败节点自动从订阅中剔除
 - **智能订阅更新**：仅包含健康节点，确保用户连接质量
 
@@ -93,15 +92,14 @@ aether-x/
 ├── main.sh                    # 主入口脚本
 │
 ├── modules/                    # 功能模块
-│   ├── xray_manager.sh        # Xray 二进制管理（下载/安装）
+│   ├── xray_manager.sh        # Xray 二进制管理（下载/安装/架构检测）
 │   ├── config_generator.sh    # 配置生成器
 │   ├── multi_server.sh        # 多机管理（SSH 部署）
 │   ├── health_checker.sh      # 健康检查模块
 │   ├── sub_manager.sh         # 订阅管理模块
 │   ├── service_manager.sh     # 服务管理（systemd）
-│   ├── sys_tuner.sh           # 系统优化器
-│   ├── env_detector.sh        # 环境检测器
-│   └── kernel_tune.sh         # 内核参数调优
+│   ├── sys_tuner.sh           # 系统优化器（BBR/内核参数/Swap/Cgroups）
+│   └── uninstaller.sh         # 卸载模块
 │
 ├── templates/                  # 配置模板
 │   ├── vless-reality.json     # VLESS + REALITY 模板
@@ -109,13 +107,16 @@ aether-x/
 │
 ├── configs/                    # 配置文件
 │   ├── servers.yaml           # 服务器列表（用户配置）
-│   └── servers.yaml.example   # 配置示例
+│   ├── servers.yaml.example   # 配置示例
+│   └── *.info                 # 节点配置信息（从服务端自动拉取，包含UUID、PublicKey等）
 │
 ├── dist/                       # 输出目录
-│   └── subscription_*.txt    # 生成的订阅文件
+│   ├── sub_*.txt             # 生成的订阅文件（Base64编码）
+│   └── sub_*.raw.txt          # 原始订阅URL列表（未编码）
 │
 └── logs/                       # 日志目录
-    └── last_check.log         # 健康检查日志
+    ├── check_YYYYMMDD_HHMMSS.log  # 健康检查日志（按时间戳保存）
+    └── last_check.log         # 最新日志的符号链接
 ```
 
 ## 使用指南
@@ -133,7 +134,7 @@ Aether-X 运维工具主菜单
 
   [1] 批量部署远程节点
   [2] 检查所有节点在线状态
-  [3] 健康检查（TCP/ICMP/IP封锁检测）
+  [3] 健康检查（TCP/ICMP/应用层检测）
   [4] 生成订阅链接
   [5] 批量卸载远程节点
   [0] 退出
@@ -144,7 +145,7 @@ Aether-X 运维工具主菜单
 菜单选项说明：
 - `[1]` 批量部署远程节点 - 选择服务器进行部署
 - `[2]` 检查所有节点在线状态 - 快速状态检查
-- `[3]` 健康检查（TCP/ICMP/IP封锁检测） - 三维检测 + IP 封锁检测
+- `[3]` 健康检查（TCP/ICMP/应用层检测） - 三维检测体系
 - `[4]` 生成订阅链接 - 基于健康检查结果生成订阅
 - `[5]` 批量卸载远程节点 - 选择服务器进行卸载
 
@@ -160,21 +161,24 @@ Aether-X 支持通过环境变量自定义行为。在运行脚本前设置以�
 | `MAX_PARALLEL` | `10` | 最大并发部署/检查数 | `export MAX_PARALLEL=5` |
 | `XRAY_VERSION` | `latest` | 指定 Xray 版本 | `export XRAY_VERSION=1.8.4` |
 | `LOG_LEVEL` | `info` | 日志级别（debug/info/warn/error） | `export LOG_LEVEL=debug` |
+| `DEBUG` | `false` | 启用调试输出（显示详细的执行日志） | `export DEBUG=true` |
 
 使用示例：
 
 ```bash
 # 跳过系统优化，仅部署 Xray
 export SKIP_TUNING=true
-./main.sh deploy
+./main.sh
+# 然后在菜单中选择 [1] 批量部署远程节点
 
 # 限制并发数为 5
 export MAX_PARALLEL=5
-./main.sh health
+./main.sh
+# 然后在菜单中选择 [3] 健康检查
 
 # 使用自定义配置文件
 export CONFIG_FILE=/path/to/my-servers.yaml
-./main.sh deploy
+./main.sh
 ```
 
 
@@ -224,10 +228,13 @@ servers:
    - 上传并执行系统优化脚本
    - 安装 Xray-core 二进制
    - 创建配置目录和日志目录
-   - 上传配置文件
+   - 在服务端生成配置文件（`/usr/local/etc/xray/config.json`）
+   - 在服务端生成配置信息文件（`/usr/local/etc/xray/config.info`，包含UUID、PublicKey等）
    - 创建 systemd 服务
    - 启动并验证服务
 4. **显示统计** - 输出部署结果和状态
+
+**注意**：部署时会在服务端生成 `config.info` 文件，生成订阅时会自动从服务端拉取到本地 `configs/{alias}.info`，方便后续使用。
 
 ### 健康检查流程
 
@@ -236,22 +243,24 @@ servers:
    - TCP 端口连通性
    - ICMP 延迟和丢包率
    - TLS 应用层握手
-3. **IP 封锁检测** - 通过 check-host.net API 检测 GFW 封锁
-4. **结果缓存** - 保存到 `logs/last_check.log`
-5. **自动过滤** - 订阅生成时仅包含健康节点
+3. **结果缓存** - 按时间戳保存到 `logs/check_YYYYMMDD_HHMMSS.log`，并创建 `last_check.log` 符号链接
+4. **自动过滤** - 订阅生成时仅包含健康节点
 
 ### 订阅生成流程
 
-1. **读取健康检查日志** - 从 `logs/last_check.log` 提取 OK 状态节点
-2. **获取节点配置** - 从本地或远程服务器读取 UUID、PublicKey 等
+1. **读取健康检查日志** - 从最新的健康检查日志提取 OK 状态节点（支持选择历史日志）
+2. **获取节点配置** - 按以下优先级获取配置信息：
+   - **方法1**：从本地 `configs/*.info` 文件读取（如果存在）
+   - **方法2**：从服务端拉取 info 文件到本地（`/usr/local/etc/xray/config.info` → `configs/{alias}.info`）
+   - **方法3**：从远程服务器读取配置文件并解析（备用方案）
 3. **生成 VLESS URL** - 格式：`vless://uuid@ip:port?type=grpc&security=reality&...`
 4. **Base64 编码** - 将所有 URL 编码为订阅格式
-5. **文件随机化** - 生成随机文件名（如 `sub_8f2d.txt`）
+5. **文件随机化** - 生成随机文件名（如 `sub_aad85773.txt`），同时保存原始 URL 文件（`.raw.txt`）
 6. **可选分发** - 上传到 S3/GitHub Pages/VPS
 
 ## 系统优化详情
 
-自动应用以下优化（通过 `sys_tuner.sh` 和 `kernel_tune.sh`）：
+自动应用以下优化（通过 `sys_tuner.sh`）：
 
 ### 内核参数优化
 
@@ -286,11 +295,11 @@ CPUQuota=50%
 
 ## 环境检测
 
-自动检测以下信息（通过 `env_detector.sh`）：
+自动检测以下信息（通过 `xray_manager.sh` 和部署流程）：
 
-- **系统信息** - 架构（x86_64/ARM64）、发行版（Ubuntu/Debian/CentOS 等）、内核版本
-- **云服务商** - AWS、GCP、腾讯云、阿里云（通过 Metadata API）
-- **防火墙状态** - UFW/firewalld/iptables，并提供配置建议
+- **系统架构** - 自动检测 x86_64/ARM64 架构（通过 `detect_arch()` 函数）
+- **系统信息** - 发行版、内核版本（在部署过程中自动检测）
+- **防火墙状态** - 部署时提供防火墙配置建议
 
 ## 依赖要求
 
@@ -330,19 +339,23 @@ vim configs/servers.yaml
 ### 示例 2: 健康检查与订阅生成
 
 ```bash
-# 1. 执行健康检查
-./main.sh health
+# 1. 运行主程序
+./main.sh
 
-# 2. 生成订阅链接（仅包含健康节点）
-./main.sh subscription
+# 2. 选择 [3] 执行健康检查（TCP/ICMP/应用层检测）
 
-# 3. 订阅文件保存在 dist/sub_*.txt
+# 3. 选择 [4] 生成订阅链接（仅包含健康节点）
+
+# 4. 订阅文件保存在 dist/sub_*.txt
 ```
 
 ### 示例 3: 查看节点状态
 
 ```bash
-./main.sh status
+# 运行主程序
+./main.sh
+
+# 选择 [2] 检查所有节点在线状态
 ```
 
 输出示例：
@@ -530,10 +543,13 @@ chmod +x /usr/local/bin/yq
 **症状**：无法生成订阅或订阅为空
 
 ```bash
-# 1. 检查健康检查日志
+# 1. 查看最新的健康检查日志
 cat logs/last_check.log
 
-# 2. 查看健康节点列表
+# 2. 查看所有历史日志
+ls -lh logs/check_*.log
+
+# 3. 查看健康节点列表
 grep "整体状态: OK" logs/last_check.log
 
 # 3. 检查订阅文件
@@ -544,10 +560,13 @@ cat dist/sub_*.raw.txt  # 查看原始 URL 列表
 base64 -d dist/sub_*.txt
 
 # 5. 检查节点配置信息
-# 从本地 info 文件
+# 从本地 info 文件（如果已拉取）
 cat configs/*.info
 
-# 从远程服务器
+# 从远程服务器 info 文件
+ssh root@<server_ip> "cat /usr/local/etc/xray/config.info"
+
+# 从远程服务器配置文件
 ssh root@<server_ip> "cat /usr/local/etc/xray/config.json | jq '.inbounds[0]'"
 ```
 
@@ -618,7 +637,7 @@ ssh root@<server_ip> "/usr/local/bin/xray -test -config /usr/local/etc/xray/conf
 | Xray 服务日志 | systemd journal | `journalctl -u xray -f` |
 | Xray 访问日志 | `/var/log/xray/access.log` | `tail -f /var/log/xray/access.log` |
 | Xray 错误日志 | `/var/log/xray/error.log` | `tail -f /var/log/xray/error.log` |
-| 健康检查日志 | `logs/last_check.log` | `cat logs/last_check.log` |
+| 健康检查日志 | `logs/check_*.log` | `cat logs/last_check.log` 或 `ls logs/check_*.log` |
 | 部署结果日志 | 临时文件 | 查看 `multi_server.sh` 输出 |
 
 ## 卸载
@@ -627,7 +646,7 @@ ssh root@<server_ip> "/usr/local/bin/xray -test -config /usr/local/etc/xray/conf
 
 ```bash
 ./main.sh
-# 选择 [6] 卸载与清理
+# 选择 [5] 批量卸载远程节点
 ```
 
 ### 手动卸载
