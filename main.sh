@@ -23,6 +23,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# 项目版本（与仓库根目录 VERSION 文件一致）
+if [ -f "${SCRIPT_DIR}/VERSION" ]; then
+    readonly AETHER_X_VERSION="$(tr -d ' \n\r' < "${SCRIPT_DIR}/VERSION")"
+else
+    readonly AETHER_X_VERSION="0.9.1"
+fi
+
 # 全局变量：用于清理钩子
 GLOBAL_TEMP_DIRS=()
 GLOBAL_TEMP_FILES=()
@@ -37,17 +44,20 @@ CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
 
-# 打印带颜色的消息
+# 打印带颜色的消息（正文用 printf %s，避免 echo -e 与 UTF-8 混用导致终端乱码）
 print_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+    printf '%b' "${GREEN}[INFO]${NC} "
+    printf '%s\n' "$*"
 }
 
 print_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    printf '%b' "${YELLOW}[WARN]${NC} "
+    printf '%s\n' "$*"
 }
 
 print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    printf '%b' "${RED}[ERROR]${NC} "
+    printf '%s\n' "$*"
 }
 
 # DEBUG输出函数（通过环境变量 DEBUG=true 启用）
@@ -58,7 +68,8 @@ debug_log() {
 }
 
 print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    printf '%b' "${GREEN}[SUCCESS]${NC} "
+    printf '%s\n' "$*"
 }
 
 print_title() {
@@ -73,6 +84,7 @@ print_menu_title() {
     echo "║    Aether-X 运维工具主菜单      ║"
     echo "╚═════════════════════════════════╝"
     echo -e "${NC}"
+    printf '%b\n' "${CYAN}版本 ${AETHER_X_VERSION}${NC}"
 }
 
 # 清理钩子函数
@@ -141,8 +153,26 @@ detect_architecture() {
         aarch64|arm64)
             echo "arm64"
             ;;
+        i386|i686)
+            echo "386"
+            ;;
         *)
             echo "amd64"  # 默认使用 amd64
+            ;;
+    esac
+}
+
+# 检测 yq 官方发行包的平台后缀（与 GitHub release 资源名一致）
+detect_yq_platform() {
+    case "$(uname -s 2>/dev/null)" in
+        Darwin)
+            echo "darwin"
+            ;;
+        Linux)
+            echo "linux"
+            ;;
+        *)
+            echo ""
             ;;
     esac
 }
@@ -186,46 +216,93 @@ except Exception as e:
 EOF
 }
 
-# 安装 yq 工具
+# 通过 Homebrew 安装 yq（仅作 GitHub 下载失败时的回退，常见于网络受限环境）
+install_yq_via_brew() {
+    if ! command -v brew >/dev/null 2>&1; then
+        return 1
+    fi
+    print_info "尝试通过 Homebrew 安装 yq（可能需要几分钟）..."
+    if HOMEBREW_NO_AUTO_UPDATE=1 brew install yq; then
+        command -v yq >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+# 安装 yq 工具（支持 Linux / macOS，与 mikefarah/yq 发行包命名一致）
 install_yq() {
     local arch=$(detect_architecture)
-    local yq_url="https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${arch}"
+    local platform=$(detect_yq_platform)
     local install_path="/usr/local/bin/yq"
-    local temp_file="/tmp/yq_${arch}"
-    
-    print_info "检测到系统架构: $arch"
-    print_info "正在下载 yq..."
-    
+
+    if [ -z "$platform" ]; then
+        print_error "当前系统不支持通过脚本自动安装 yq（仅支持 Linux 与 macOS）"
+        print_info "请手动安装: https://github.com/mikefarah/yq#install"
+        return 1
+    fi
+
+    # 386 架构无官方通用二进制包时，交给 brew（mac 极少见）或提示手动安装
+    if [ "$arch" = "386" ] && [ "$platform" != "linux" ]; then
+        print_warn "当前架构无对应 yq 预编译包，尝试 Homebrew..."
+        install_yq_via_brew && return 0
+        return 1
+    fi
+
+    local yq_name="yq_${platform}_${arch}"
+    local yq_url="https://github.com/mikefarah/yq/releases/latest/download/${yq_name}"
+    local temp_file="/tmp/${yq_name}.$$"
+
+    print_info "检测到平台: ${platform}/${arch}"
+    print_info "正在下载 yq: ${yq_name} ..."
+
     # 尝试下载
     if command -v wget >/dev/null 2>&1; then
         if wget -q "$yq_url" -O "$temp_file" 2>/dev/null; then
             print_success "下载成功"
         else
-            print_error "下载失败，请检查网络连接"
+            print_error "从 GitHub 下载失败，请检查网络或代理"
+            rm -f "$temp_file"
+            if [ "$platform" = "darwin" ] && install_yq_via_brew; then
+                print_success "已通过 Homebrew 安装 yq"
+                return 0
+            fi
             return 1
         fi
     elif command -v curl >/dev/null 2>&1; then
-        if curl -sL "$yq_url" -o "$temp_file" 2>/dev/null; then
+        if curl -fsSL "$yq_url" -o "$temp_file" 2>/dev/null; then
             print_success "下载成功"
         else
-            print_error "下载失败，请检查网络连接"
+            print_error "从 GitHub 下载失败，请检查网络或代理"
+            rm -f "$temp_file"
+            if [ "$platform" = "darwin" ] && install_yq_via_brew; then
+                print_success "已通过 Homebrew 安装 yq"
+                return 0
+            fi
             return 1
         fi
     else
         print_error "未找到 wget 或 curl，无法下载 yq"
+        if [ "$platform" = "darwin" ] && install_yq_via_brew; then
+            print_success "已通过 Homebrew 安装 yq"
+            return 0
+        fi
         return 1
     fi
-    
+
     # 设置执行权限
     chmod +x "$temp_file"
-    
-    # 验证下载的文件
+
+    # 验证下载的文件（此前 mac 上误下 linux 包会在此处失败）
     if ! "$temp_file" --version >/dev/null 2>&1; then
-        print_error "下载的文件无效"
+        print_error "下载的文件无法在本机执行（可能下错平台或文件损坏）"
         rm -f "$temp_file"
+        if [ "$platform" = "darwin" ] && install_yq_via_brew; then
+            print_success "已通过 Homebrew 安装 yq"
+            return 0
+        fi
         return 1
     fi
-    
+
     # 尝试安装到系统目录
     if [ -w "$(dirname "$install_path")" ]; then
         # 有写权限，直接移动
@@ -633,13 +710,24 @@ except yaml.YAMLError as e:
         
         # 检查是否在交互式终端
         if [ -t 0 ] && [ -t 1 ]; then
-            echo ""
-            echo -ne "${YELLOW}是否自动安装 yq？[Y/n]: ${NC}"
-            read -r install_confirm
-            
-            if [[ ! "$install_confirm" =~ ^[Nn]$ ]]; then
+            local should_install=false
+            if [ "${AUTO_INSTALL_YQ:-false}" = "true" ]; then
+                print_info "AUTO_INSTALL_YQ=true，自动安装 yq..."
+                should_install=true
+            else
+                echo ""
+                echo -ne "${YELLOW}是否自动安装 yq？[Y/n]: ${NC}"
+                read -r install_confirm
+                if [[ ! "$install_confirm" =~ ^[Nn]$ ]]; then
+                    should_install=true
+                else
+                    ((check_failed++))
+                fi
+            fi
+
+            if [ "$should_install" = "true" ] && [ "$check_failed" -eq 0 ]; then
                 if install_yq; then
-                    # 验证安装
+                    hash -r 2>/dev/null || true
                     if command -v yq >/dev/null 2>&1; then
                         print_success "yq 安装成功"
                     else
@@ -648,13 +736,12 @@ except yaml.YAMLError as e:
                 else
                     ((check_failed++))
                 fi
-            else
-                ((check_failed++))
             fi
         else
-            # 非交互模式，尝试自动安装
+            # 非交互模式：默认尝试自动安装（也可通过 AUTO_INSTALL_YQ=false 仅走下方 pyyaml / 失败分支，此处保持原行为）
             print_info "非交互模式，尝试自动安装 yq..."
             if install_yq; then
+                hash -r 2>/dev/null || true
                 if command -v yq >/dev/null 2>&1; then
                     print_success "yq 安装成功"
                 else
@@ -743,6 +830,11 @@ Aether-X - Xray-core 自动化部署工具
   [0] 退出
 
 配置文件: configs/servers.yaml
+
+环境变量（可选）:
+  AUTO_INSTALL_YQ=true   启动依赖检查时不再询问，直接尝试安装 yq（GitHub 或 macOS 下 Homebrew）
+  SKIP_DEP_CHECK=true    跳过本地依赖检查（不推荐）
+  SKIP_PING_CHECK=true   跳过网络 ping 预检
 
 EOF
 }
@@ -844,8 +936,8 @@ menu_health_check() {
     # 加载模块
     load_module "health_checker"
     
-    # 执行健康检查
-    batch_health_check "$config_file" "true" "10"
+    # 执行健康检查（并发数可通过环境变量 MAX_PARALLEL 覆盖，默认 10）
+    batch_health_check "$config_file" "true" "${MAX_PARALLEL:-10}"
 }
 
 # 选项5: 生成订阅链接
@@ -1149,6 +1241,11 @@ select_servers() {
 
 # 主函数
 main() {
+    if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then
+        printf '%s\n' "Aether-X ${AETHER_X_VERSION}"
+        exit 0
+    fi
+
     # 设置默认配置
     CONFIG_FILE="${SCRIPT_DIR}/configs/servers.yaml"
     

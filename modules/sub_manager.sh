@@ -159,6 +159,7 @@ url_encode() {
 }
 
 # 从远程服务器读取Xray配置信息
+# 输出一行：uuid|port|ws_path|tls_sni|allow_insecure|network
 get_remote_xray_config() {
     local ssh_cmd=$1
     local config_path="/usr/local/etc/xray/config.json"
@@ -170,37 +171,46 @@ get_remote_xray_config() {
         return 1
     fi
     
-    # 解析配置
-    local uuid=$(echo "$config_json" | grep -o '"id": "[^"]*"' | head -1 | cut -d'"' -f4)
-    local port=$(echo "$config_json" | grep -o '"port": [0-9]*' | head -1 | cut -d':' -f2 | tr -d ' ')
-    local private_key=$(echo "$config_json" | grep -o '"privateKey": "[^"]*"' | head -1 | cut -d'"' -f4)
-    local server_name=$(echo "$config_json" | grep -o '"serverNames": \[[^]]*\]' | grep -o '"[^"]*"' | head -1 | cut -d'"' -f2)
-    local short_id=$(echo "$config_json" | grep -o '"shortIds": \[[^]]*\]' | grep -o '"[^"]*"' | head -1 | cut -d'"' -f2)
-    local service_name=$(echo "$config_json" | grep -o '"serviceName": "[^"]*"' | head -1 | cut -d'"' -f4)
-    local network=$(echo "$config_json" | grep -o '"network": "[^"]*"' | head -1 | cut -d'"' -f4)
+    local uuid="" port="" ws_path="" tls_sni="" network="" security=""
     
-    # 如果没有找到network，默认为grpc
-    network=${network:-grpc}
-    
-    # 如果找到了privateKey，需要转换为publicKey
-    local public_key=""
-    if [ -n "$private_key" ]; then
-        # 尝试使用xray获取public key
-        public_key=$($ssh_cmd "/usr/local/bin/xray x25519 -i $private_key 2>/dev/null | grep -i public | awk '{print \$NF}'" 2>/dev/null)
+    if command -v jq >/dev/null 2>&1; then
+        uuid=$(echo "$config_json" | jq -r '.inbounds[0].settings.clients[0].id // empty' 2>/dev/null)
+        port=$(echo "$config_json" | jq -r '.inbounds[0].port // empty' 2>/dev/null)
+        network=$(echo "$config_json" | jq -r '.inbounds[0].streamSettings.network // empty' 2>/dev/null)
+        security=$(echo "$config_json" | jq -r '.inbounds[0].streamSettings.security // empty' 2>/dev/null)
+        ws_path=$(echo "$config_json" | jq -r '.inbounds[0].streamSettings.wsSettings.path // empty' 2>/dev/null)
     fi
     
-    # 如果无法获取public key，尝试从配置中读取
-    if [ -z "$public_key" ]; then
-        # 某些配置可能直接存储publicKey
-        public_key=$(echo "$config_json" | grep -o '"publicKey": "[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ -z "$uuid" ]; then
+        uuid=$(echo "$config_json" | grep -o '"id": "[^"]*"' | head -1 | cut -d'"' -f4)
+    fi
+    if [ -z "$port" ]; then
+        port=$(echo "$config_json" | grep -o '"port": [0-9]*' | head -1 | cut -d':' -f2 | tr -d ' ')
+    fi
+    if [ -z "$network" ]; then
+        network=$(echo "$config_json" | grep -o '"network": "[^"]*"' | head -1 | cut -d'"' -f4)
+    fi
+    if [ -z "$ws_path" ]; then
+        ws_path=$(echo "$config_json" | grep -o '"path": "[^"]*"' | head -1 | sed 's/.*"path": "\([^"]*\)".*/\1/')
     fi
     
-    # 设置默认值
+    network=${network:-ws}
     port=${port:-$DEFAULT_XRAY_PORT}
-    server_name=${server_name:-www.microsoft.com}
-    service_name=${service_name:-GunService}
+    tls_sni=""
+    if [ "$network" = "ws" ] && [ -n "$ws_path" ]; then
+        if [ -z "$security" ]; then
+            security=$(echo "$config_json" | grep -o '"security": "[^"]*"' | head -1 | cut -d'"' -f4)
+        fi
+        if [ "$security" = "tls" ] || [ -z "$security" ]; then
+            tls_sni=$($ssh_cmd "openssl x509 -in /etc/ssl/certs/xray.crt -noout -subject 2>/dev/null | sed -n 's/^.*CN[[:space:]]*=[[:space:]]*//p' | awk '{print \$1}' | tr -d ','" 2>/dev/null)
+        fi
+    fi
     
-    echo "${uuid}|${port}|${public_key}|${server_name}|${short_id}|${service_name}|${network}"
+    if [ -z "$ws_path" ] || [ "$network" != "ws" ]; then
+        return 1
+    fi
+    
+    echo "${uuid}|${port}|${ws_path}|${tls_sni}|1|${network}"
     return 0
 }
 
@@ -270,14 +280,12 @@ get_local_config_info() {
         return 1
     fi
     
-    # 解析info文件
-    local uuid=$(grep "UUID:" "$info_file" | awk '{print $2}')
-    local public_key=$(grep "Public Key:" "$info_file" | awk '{print $3}')
-    local short_id=$(grep "ShortID:" "$info_file" | awk '{print $2}')
-    local server_name=$(grep "Server Name:" "$info_file" | awk '{print $3}')
-    local service_name=$(grep "gRPC ServiceName:" "$info_file" | awk '{print $2}')
+    # 解析 info（VLESS + WS + TLS）
+    local uuid=$(grep "UUID:" "$info_file" | head -1 | sed 's/^[[:space:]]*UUID:[[:space:]]*//' | tr -d '\r')
+    local ws_path=$(grep "WS Path:" "$info_file" | head -1 | sed 's/^[[:space:]]*WS Path:[[:space:]]*//' | tr -d '\r')
+    local tls_sni=$(grep "TLS SNI" "$info_file" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
     
-    if [ -z "$uuid" ] || [ -z "$public_key" ]; then
+    if [ -z "$uuid" ] || [ -z "$ws_path" ]; then
         return 1
     fi
     
@@ -289,44 +297,39 @@ get_local_config_info() {
         port=${port:-$DEFAULT_XRAY_PORT}
     fi
     
-    echo "${uuid}|${port}|${public_key}|${server_name}|${short_id}|${service_name}|grpc"
+    echo "${uuid}|${port}|${ws_path}|${tls_sni}|1|ws"
     return 0
 }
 
-# 生成VLESS URL
+# 生成 VLESS URL（WS + TLS，与 Clash 等兼容）
+# 参数: alias ip port uuid ws_path tls_sni allow_insecure network
 generate_vless_url() {
     local alias=$1
     local ip=$2
     local port=$3
     local uuid=$4
-    local public_key=$5
-    local server_name=$6
-    local short_id=$7
-    local service_name=$8
-    local network=${9:-grpc}
+    local ws_path=$5
+    local tls_sni=$6
+    local allow_insecure=${7:-1}
+    local network=${8:-ws}
     
-    # URL编码参数
-    local encoded_sni=$(url_encode "$server_name")
-    local encoded_service=$(url_encode "$service_name")
-    
-    # 构建VLESS URL
-    # 格式: vless://uuid@ip:port?type=grpc&security=reality&sni=server_name&pbk=public_key&sid=short_id&spx=%2F&serviceName=service_name&fp=chrome#alias
-    
-    local url="vless://${uuid}@${ip}:${port}?type=${network}&security=reality"
-    url="${url}&sni=${encoded_sni}"
-    url="${url}&pbk=${public_key}"
-    
-    if [ -n "$short_id" ]; then
-        url="${url}&sid=${short_id}"
+    if [ -z "$tls_sni" ]; then
+        tls_sni=$ip
     fi
     
-    url="${url}&spx=%2F"
+    local enc_path
+    local enc_sni
+    local enc_host
+    enc_path=$(url_encode "$ws_path")
+    enc_sni=$(url_encode "$tls_sni")
+    enc_host=$(url_encode "$tls_sni")
     
-    if [ "$network" = "grpc" ] && [ -n "$service_name" ]; then
-        url="${url}&serviceName=${encoded_service}"
+    # encryption=none 便于 Clash / 部分解析器识别 VLESS
+    local url="vless://${uuid}@${ip}:${port}?encryption=none&type=${network}&security=tls"
+    url="${url}&path=${enc_path}&host=${enc_host}&sni=${enc_sni}"
+    if [ "$allow_insecure" = "1" ] || [ "$allow_insecure" = "true" ]; then
+        url="${url}&allowInsecure=1"
     fi
-    
-    url="${url}&fp=chrome"
     url="${url}#$(url_encode "$alias")"
     
     echo "$url"
@@ -384,6 +387,27 @@ get_healthy_nodes() {
     fi
 }
 
+# 从 "alias|ip" 字符串列表中解析 IP（兼容 Bash 3，不使用关联数组）
+_lookup_ip_for_alias_pairs() {
+    local want="$1"
+    shift
+    local pair a ip
+    for pair in "$@"; do
+        [ -z "$pair" ] && continue
+        case "$pair" in
+            *'|'*) ;;
+            *) continue ;;
+        esac
+        a="${pair%%|*}"
+        ip="${pair#*|}"
+        if [ "$a" = "$want" ]; then
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # 生成订阅内容
 generate_subscription() {
     local yaml_file=$1
@@ -399,8 +423,8 @@ generate_subscription() {
     print_info "读取健康检查结果..."
     local healthy_nodes_raw=($(get_healthy_nodes "$check_log" 2>/dev/null))
     
-    # 解析健康节点，提取别名和IP
-    declare -A node_ip_map
+    # 解析健康节点，提取别名和IP（node_ip_pairs: 与 Bash 4 关联数组等价的索引数组）
+    local node_ip_pairs=()
     local healthy_nodes=()
     
     for node_info in "${healthy_nodes_raw[@]}"; do
@@ -410,7 +434,7 @@ generate_subscription() {
             if [ -n "$node_alias" ]; then
                 healthy_nodes+=("$node_alias")
                 if [ -n "$node_ip" ]; then
-                    node_ip_map["$node_alias"]="$node_ip"
+                    node_ip_pairs+=("$node_alias|$node_ip")
                 fi
             fi
         else
@@ -469,8 +493,8 @@ generate_subscription() {
         local ssh_key=""
         
         # 优先从健康检查日志中获取IP
-        if [ -n "${node_ip_map[$node_alias]}" ]; then
-            ip="${node_ip_map[$node_alias]}"
+        if [ ${#node_ip_pairs[@]} -gt 0 ]; then
+            ip=$(_lookup_ip_for_alias_pairs "$node_alias" "${node_ip_pairs[@]}") || ip=""
         fi
         
         # 如果日志中没有IP，从配置文件中读取
@@ -528,24 +552,26 @@ generate_subscription() {
             continue
         fi
         
-        # 解析配置信息
+        # 解析配置信息：uuid|port|ws_path|tls_sni|allow_insecure|network
         local uuid=$(echo "$config_info" | cut -d'|' -f1)
         local port=$(echo "$config_info" | cut -d'|' -f2)
-        local public_key=$(echo "$config_info" | cut -d'|' -f3)
-        local server_name=$(echo "$config_info" | cut -d'|' -f4)
-        local short_id=$(echo "$config_info" | cut -d'|' -f5)
-        local service_name=$(echo "$config_info" | cut -d'|' -f6)
-        local network=$(echo "$config_info" | cut -d'|' -f7)
+        local ws_path=$(echo "$config_info" | cut -d'|' -f3)
+        local tls_sni=$(echo "$config_info" | cut -d'|' -f4)
+        local allow_insecure=$(echo "$config_info" | cut -d'|' -f5)
+        local network=$(echo "$config_info" | cut -d'|' -f6)
         
-        if [ -z "$uuid" ] || [ -z "$public_key" ]; then
-            print_warn "节点 $node_alias 配置信息不完整，跳过"
+        if [ -z "$tls_sni" ]; then
+            tls_sni=$ip
+        fi
+        
+        if [ -z "$uuid" ] || [ -z "$ws_path" ] || [ "$network" != "ws" ]; then
+            print_warn "节点 $node_alias 配置信息不完整（需 WS+TLS），跳过"
             ((fail_count++))
             continue
         fi
         
-        # 生成VLESS URL
         local vless_url=$(generate_vless_url "$node_alias" "$ip" "$port" "$uuid" \
-            "$public_key" "$server_name" "$short_id" "$service_name" "$network")
+            "$ws_path" "$tls_sni" "$allow_insecure" "$network")
         
         vless_urls+=("$vless_url")
         ((success_count++))
@@ -574,6 +600,13 @@ generate_subscription() {
     local raw_file="${output_file%.txt}.raw.txt"
     printf '%s\n' "${vless_urls[@]}" > "$raw_file"
     print_info "原始URL列表已保存: $raw_file"
+    
+    # 输出目录内稳定文件名符号链接，便于本工具或外部脚本引用（不写入用户家目录下的客户端配置）
+    local out_dir
+    out_dir=$(cd "$(dirname "$output_file")" && pwd 2>/dev/null) || out_dir=""
+    if [ -n "$out_dir" ]; then
+        ln -sf "$out_dir/$(basename "$output_file")" "$out_dir/aether-subscription.txt" 2>/dev/null || true
+    fi
     
     return 0
 }

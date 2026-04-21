@@ -17,16 +17,20 @@ fi
 # 打印函数（如果未定义）
 if ! declare -f print_info >/dev/null; then
     print_info() {
-        echo -e "${GREEN}[INFO]${NC} $1"
+        printf '%b' "${GREEN}[INFO]${NC} "
+        printf '%s\n' "$*"
     }
     print_warn() {
-        echo -e "${YELLOW}[WARN]${NC} $1"
+        printf '%b' "${YELLOW}[WARN]${NC} "
+        printf '%s\n' "$*"
     }
     print_error() {
-        echo -e "${RED}[ERROR]${NC} $1"
+        printf '%b' "${RED}[ERROR]${NC} "
+        printf '%s\n' "$*"
     }
     print_success() {
-        echo -e "${GREEN}[SUCCESS]${NC} $1"
+        printf '%b' "${GREEN}[SUCCESS]${NC} "
+        printf '%s\n' "$*"
     }
     print_title() {
         echo -e "${BLUE}========================================${NC}"
@@ -513,7 +517,13 @@ save_check_log() {
 batch_health_check() {
     local yaml_file=$1
     local parallel_mode=${2:-true}
-    local max_parallel=${3:-10}
+    local max_parallel_raw="${3:-${MAX_PARALLEL:-10}}"
+    # 仅保留数字，避免 MAX_PARALLEL 含不可见/非 ASCII 字符时在终端显示为 �
+    local max_digits="${max_parallel_raw//[^0-9]/}"
+    local max_parallel=10
+    if [ -n "$max_digits" ] && [ "$max_digits" -ge 1 ] 2>/dev/null; then
+        max_parallel=$((max_digits))
+    fi
     
     if [ ! -f "$yaml_file" ]; then
         print_error "配置文件不存在: $yaml_file"
@@ -546,7 +556,7 @@ batch_health_check() {
     local result_files=()
     local check_count=0
     
-    print_info "开始检查（并发模式: $parallel_mode, 最大并发数: $max_parallel）..."
+    print_info "开始检查 (并发模式: ${parallel_mode}, 最大并发数: ${max_parallel}) ..."
     echo ""
     
     # 处理每台服务器

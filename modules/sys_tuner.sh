@@ -316,10 +316,9 @@ configure_xray_limits() {
     local override_dir="$systemd_dir/xray.service.d"
     local override_file="$override_dir/limits.conf"
     
-    # 检查 xray.service 是否存在
+    # 检查 xray.service 是否存在（首次部署时先跑系统优化，此时单元尚未安装，属正常情况）
     if [ ! -f "$xray_service" ] && [ ! -f "$systemd_dir/xray@.service" ]; then
-        print_warn "Xray systemd 服务文件不存在，跳过资源限制配置"
-        print_info "将在 Xray 安装后自动配置"
+        print_info "Xray systemd 单元尚未就绪，跳过资源限制（部署流程在注册服务后会再配置一次）"
         return 0
     fi
     

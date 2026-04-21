@@ -102,6 +102,54 @@ verify_hash() {
     fi
 }
 
+# 尽量提供 unzip 命令（云主机最小镜像常未预装）
+ensure_unzip_command() {
+    if command -v unzip >/dev/null 2>&1; then
+        return 0
+    fi
+    print_info "未检测到 unzip，尝试通过包管理器安装..."
+    if command -v apt-get >/dev/null 2>&1; then
+        if DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null && \
+           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip 2>/dev/null; then
+            command -v unzip >/dev/null 2>&1 && return 0
+        fi
+    fi
+    if command -v dnf >/dev/null 2>&1; then
+        dnf install -y unzip >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 && return 0
+    fi
+    if command -v yum >/dev/null 2>&1; then
+        yum install -y unzip >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 && return 0
+    fi
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache unzip >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+# 解压 Xray 官方 zip（unzip 不可用时回退到 python3）
+extract_xray_release_zip() {
+    local zip_file=$1
+    local dest_dir=$2
+
+    if ensure_unzip_command; then
+        if unzip -q "$zip_file" -d "$dest_dir"; then
+            return 0
+        fi
+        print_warn "unzip 执行失败，尝试 python3..."
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        print_info "使用 python3 解压 zip..."
+        if python3 -c "import zipfile, sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$zip_file" "$dest_dir"; then
+            return 0
+        fi
+    fi
+    print_error "解压失败（请确保可 apt install unzip 或已安装 python3）"
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -l "$zip_file" 2>&1 | head -20 || true
+    fi
+    return 1
+}
+
 # 检测网络连接（测试是否能访问外部网络）
 check_network_connectivity() {
     local test_urls=(
@@ -533,17 +581,21 @@ install_xray() {
     
     # 解压
     print_info "解压文件..."
-    if ! unzip -q "$zip_file" -d "$temp_dir" 2>/dev/null; then
-        print_error "解压失败"
+    if ! extract_xray_release_zip "$zip_file" "$temp_dir"; then
         return 1
     fi
     
-    # 检查解压后的文件
+    # 检查解压后的文件（发布包内二进制通常名为 xray，兼容子目录）
     local binary_file="$temp_dir/xray"
-    if [ ! -f "$binary_file" ] || [ ! -x "$binary_file" ]; then
-        print_error "解压后的文件无效"
+    if [ ! -f "$binary_file" ]; then
+        binary_file=$(find "$temp_dir" -type f -name xray 2>/dev/null | head -1)
+    fi
+    if [ -z "$binary_file" ] || [ ! -f "$binary_file" ]; then
+        print_error "解压后的文件无效（未找到 xray 可执行文件）"
+        find "$temp_dir" -type f 2>/dev/null | head -20 || true
         return 1
     fi
+    chmod +x "$binary_file" 2>/dev/null || true
     
     # 安装二进制文件
     if ! install_xray_binary "$binary_file"; then

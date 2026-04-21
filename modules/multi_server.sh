@@ -58,6 +58,8 @@ build_ssh_cmd() {
     ssh_cmd="$ssh_cmd -o ConnectTimeout=10"
     ssh_cmd="$ssh_cmd -o BatchMode=yes"
     ssh_cmd="$ssh_cmd -o UserKnownHostsFile=/dev/null"
+    # 抑制「Permanently added ...」等提示；连接失败仍会输出（可用 SSH_CLIENT_LOG_LEVEL 覆盖，如 ERROR）
+    ssh_cmd="$ssh_cmd -o LogLevel=${SSH_CLIENT_LOG_LEVEL:-FATAL}"
     
     # 展开 ~ 路径
     if [ -n "$ssh_key" ]; then
@@ -69,12 +71,9 @@ build_ssh_cmd() {
         fi
     fi
     
-    # 添加默认 SSH 选项（如果设置了环境变量）
+    # 追加用户自定义 SSH 选项（勿重复写死 ConnectTimeout 等，上面已设置）
     if [ -n "${SSH_OPTS:-}" ]; then
         ssh_cmd="$ssh_cmd $SSH_OPTS"
-    else
-        # 默认选项
-        ssh_cmd="$ssh_cmd -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
     fi
     
     ssh_cmd="$ssh_cmd $ssh_user@$server_ip"
@@ -98,6 +97,7 @@ build_scp_cmd() {
         scp_cmd="$scp_cmd -o ConnectTimeout=10"
         scp_cmd="$scp_cmd -o BatchMode=yes"
         scp_cmd="$scp_cmd -o UserKnownHostsFile=/dev/null"
+        scp_cmd="$scp_cmd -o LogLevel=${SSH_CLIENT_LOG_LEVEL:-FATAL}"
     fi
     
     if [ -n "$ssh_key" ]; then
@@ -108,6 +108,15 @@ build_scp_cmd() {
     fi
     
     echo "$scp_cmd"
+}
+
+# 非 root SSH 登录时，远程需特权的命令加此前缀（依赖目标机免密 sudo，AWS Ubuntu 等默认已配置）
+remote_sudo_prefix() {
+    if [ "${1:-}" = "root" ]; then
+        printf ''
+    else
+        printf 'sudo '
+    fi
 }
 
 # SSH 连接预检（检查密钥是否生效）
@@ -122,8 +131,16 @@ precheck_ssh_connection() {
     
     local ssh_cmd=$(build_ssh_cmd "$server_ip" "$ssh_port" "$ssh_user" "$ssh_key")
     
-    # 测试连接（超时 5 秒）
-    if timeout 5 $ssh_cmd "echo 'SSH connection test successful'" >/dev/null 2>&1; then
+    # 测试连接（ssh 已含 ConnectTimeout；macOS 通常无 GNU timeout，勿依赖 timeout 命令）
+    local ok=1
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5 $ssh_cmd "echo 'SSH connection test successful'" >/dev/null 2>&1 && ok=0
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout 5 $ssh_cmd "echo 'SSH connection test successful'" >/dev/null 2>&1 && ok=0
+    else
+        $ssh_cmd "echo 'SSH connection test successful'" >/dev/null 2>&1 && ok=0
+    fi
+    if [ "$ok" -eq 0 ]; then
         print_success "[$server_alias] SSH 连接预检通过"
         return 0
     else
@@ -187,13 +204,15 @@ deploy_to_server_remote() {
     
     local ssh_cmd=$(build_ssh_cmd "$server_ip" "$ssh_port" "$ssh_user" "$ssh_key")
     local remote_modules="$REMOTE_MODULES_DIR"
+    local RSUDO
+    RSUDO=$(remote_sudo_prefix "$ssh_user")
     
     print_info "[$server_alias] 开始远程部署流程..."
     
     # 步骤 1: 执行系统优化
     print_info "[$server_alias] 步骤 1/3: 执行系统优化..."
     echo "----------------------------------------"
-    if $ssh_cmd "bash $remote_modules/sys_tuner.sh" 2>&1 | sed "s/^/  [$server_alias] /"; then
+    if $ssh_cmd "${RSUDO}bash $remote_modules/sys_tuner.sh" 2>&1 | sed "s/^/  [$server_alias] /"; then
         echo "----------------------------------------"
         print_success "[$server_alias] 系统优化完成"
     else
@@ -205,7 +224,7 @@ deploy_to_server_remote() {
     # 步骤 2: 安装 Xray 二进制文件（关键步骤，失败则停止）
     print_info "[$server_alias] 步骤 2/4: 安装 Xray-core..."
     echo "----------------------------------------"
-    if $ssh_cmd "bash $remote_modules/xray_manager.sh" 2>&1 | sed "s/^/  [$server_alias] /"; then
+    if $ssh_cmd "${RSUDO}bash $remote_modules/xray_manager.sh" 2>&1 | sed "s/^/  [$server_alias] /"; then
         local step2_exit=0
     else
         local step2_exit=${PIPESTATUS[0]}
@@ -215,8 +234,8 @@ deploy_to_server_remote() {
     # 验证 Xray 是否真正安装成功
     if [ $step2_exit -eq 0 ]; then
         # 再次验证 Xray 文件是否存在且可执行
-        if $ssh_cmd "test -f /usr/local/bin/xray && test -x /usr/local/bin/xray" 2>/dev/null; then
-            local xray_version=$($ssh_cmd "/usr/local/bin/xray version 2>/dev/null | head -1" || echo "unknown")
+        if $ssh_cmd "${RSUDO}test -f /usr/local/bin/xray && ${RSUDO}test -x /usr/local/bin/xray" 2>/dev/null; then
+            local xray_version=$($ssh_cmd "${RSUDO}bash -c '/usr/local/bin/xray version 2>/dev/null | head -1'" || echo "unknown")
             print_success "[$server_alias] Xray 安装成功: $xray_version"
         else
             print_error "[$server_alias] Xray 安装失败：二进制文件不存在或不可执行"
@@ -238,8 +257,8 @@ deploy_to_server_remote() {
         return 1
     fi
     
-    # 在远程执行配置生成（静默模式，只输出错误）
-    if $ssh_cmd "REMOTE_MODULES_DIR='$remote_modules' SERVER_IP='$server_ip' bash -c '
+    # 在远程执行配置生成（静默模式，只输出错误；用 env 保证经 sudo 时变量仍传入子 shell）
+    if $ssh_cmd "${RSUDO}env REMOTE_MODULES_DIR='$remote_modules' SERVER_IP='$server_ip' bash -c '
 source \"\$REMOTE_MODULES_DIR/config_generator.sh\" >/dev/null 2>&1 || {
     echo \"ERROR: 无法加载配置生成模块\" >&2
     exit 1
@@ -248,9 +267,9 @@ mkdir -p /usr/local/etc/xray || {
     echo \"ERROR: 无法创建配置目录\" >&2
     exit 1
 }
-if declare -f generate_vless_reality_grpc_config >/dev/null 2>&1; then
+if declare -f generate_vless_ws_tls_config >/dev/null 2>&1; then
     # 静默生成配置（重定向所有输出）
-    generate_vless_reality_grpc_config \"\$SERVER_IP\" 443 \"/usr/local/etc/xray/config.json\" \"\" \"/usr/local/bin/xray\" >/dev/null 2>&1
+    generate_vless_ws_tls_config \"\$SERVER_IP\" 443 \"/usr/local/etc/xray/config.json\" \"\" >/dev/null 2>&1
     if [ \$? -eq 0 ] && [ -f \"/usr/local/etc/xray/config.json\" ] && [ -s \"/usr/local/etc/xray/config.json\" ]; then
         chmod 644 /usr/local/etc/xray/config.json
         # 确保 info 文件也保存到配置目录（generate_server_config会自动生成）
@@ -263,7 +282,7 @@ if declare -f generate_vless_reality_grpc_config >/dev/null 2>&1; then
         exit 1
     fi
 else
-    echo \"ERROR: 配置生成函数不可用\" >&2
+    echo \"ERROR: 配置生成函数 generate_vless_ws_tls_config 不可用\" >&2
     exit 1
 fi
 '" 2>&1 | sed "s/^/  [$server_alias] /"; then
@@ -278,8 +297,8 @@ fi
     fi
     
     # 验证配置文件
-    if $ssh_cmd "test -f /usr/local/etc/xray/config.json" >/dev/null 2>&1; then
-        local config_size=$($ssh_cmd "stat -f%z /usr/local/etc/xray/config.json 2>/dev/null || stat -c%s /usr/local/etc/xray/config.json 2>/dev/null || echo '0'")
+    if $ssh_cmd "${RSUDO}test -f /usr/local/etc/xray/config.json" >/dev/null 2>&1; then
+        local config_size=$($ssh_cmd "${RSUDO}bash -c 'stat -f%z /usr/local/etc/xray/config.json 2>/dev/null || stat -c%s /usr/local/etc/xray/config.json 2>/dev/null || echo 0'")
         print_success "[$server_alias] 配置文件生成成功 (大小: $config_size 字节)"
     else
         print_error "[$server_alias] 配置文件生成但验证失败"
@@ -290,7 +309,7 @@ fi
     # 步骤 4: 注册 systemd 服务（关键步骤，失败则停止）
     print_info "[$server_alias] 步骤 4/4: 注册 systemd 服务..."
     echo "----------------------------------------"
-    if $ssh_cmd "bash $remote_modules/service_manager.sh" 2>&1 | sed "s/^/  [$server_alias] /"; then
+    if $ssh_cmd "${RSUDO}bash $remote_modules/service_manager.sh" 2>&1 | sed "s/^/  [$server_alias] /"; then
         local exit_code=0
     else
         local exit_code=${PIPESTATUS[0]}
@@ -304,18 +323,25 @@ fi
     fi
     
     # 验证服务文件是否存在
-    if ! $ssh_cmd "test -f /etc/systemd/system/xray.service" 2>/dev/null; then
+    if ! $ssh_cmd "${RSUDO}test -f /etc/systemd/system/xray.service" 2>/dev/null; then
         print_error "[$server_alias] 服务文件创建失败"
         return 1
     fi
     
     print_success "[$server_alias] 服务注册完成"
     
+    # 系统优化阶段尚无 xray.service；此处单元已就绪，补配 systemd 资源限制（与 sys_tuner 中 configure_xray_limits 一致）
+    print_info "[$server_alias] 配置 Xray systemd 资源限制..."
+    $ssh_cmd "${RSUDO}bash -c 'source $remote_modules/sys_tuner.sh && configure_xray_limits'" 2>&1 | sed "s/^/  [$server_alias] /"
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+        print_warn "[$server_alias] 资源限制配置失败（非致命，可检查目标机 journalctl / systemd）"
+    fi
+    
     # 启动服务（配置文件已在步骤3生成）
     print_info "[$server_alias] 启动 Xray 服务..."
-    $ssh_cmd "systemctl reset-failed xray" >/dev/null 2>&1 || true
+    $ssh_cmd "${RSUDO}systemctl reset-failed xray" >/dev/null 2>&1 || true
     
-    if $ssh_cmd "bash -c 'source $remote_modules/service_manager.sh && start_xray_service'" 2>&1 | sed "s/^/  [$server_alias] /"; then
+    if $ssh_cmd "${RSUDO}bash -c 'source $remote_modules/service_manager.sh && start_xray_service'" 2>&1 | sed "s/^/  [$server_alias] /"; then
         local start_exit=0
     else
         local start_exit=${PIPESTATUS[0]}
@@ -323,10 +349,10 @@ fi
     
     # 等待并验证服务状态
     sleep 2
-    $ssh_cmd "systemctl reset-failed xray" >/dev/null 2>&1 || true
+    $ssh_cmd "${RSUDO}systemctl reset-failed xray" >/dev/null 2>&1 || true
     sleep 1
     
-    if $ssh_cmd "systemctl is-active --quiet xray" >/dev/null 2>&1; then
+    if $ssh_cmd "${RSUDO}systemctl is-active --quiet xray" >/dev/null 2>&1; then
         print_success "[$server_alias] 服务启动成功"
     else
         print_warn "[$server_alias] 服务启动失败 (退出码: $start_exit)"
@@ -727,6 +753,8 @@ batch_check_status() {
         
         debug_log "构建SSH命令"
         local ssh_cmd=$(build_ssh_cmd "$ip" "$ssh_port" "$ssh_user" "$ssh_key")
+        local RSUDO
+        RSUDO=$(remote_sudo_prefix "$ssh_user")
         
         # 检查 SSH 连接
         debug_log "检查SSH连接: $alias"
@@ -741,8 +769,8 @@ batch_check_status() {
         
         debug_log "SSH连接成功，检查Xray服务状态"
         # 检查 Xray 服务状态
-        if $ssh_cmd "systemctl is-active --quiet xray" 2>/dev/null; then
-            local version=$($ssh_cmd "/usr/local/bin/xray version 2>/dev/null | head -1" || echo "unknown")
+        if $ssh_cmd "${RSUDO}systemctl is-active --quiet xray" 2>/dev/null; then
+            local version=$($ssh_cmd "${RSUDO}bash -c '/usr/local/bin/xray version 2>/dev/null | head -1'" || echo "unknown")
             print_success "[$alias] Xray 服务运行中 - $version"
             set +e
             ((online_count++)) 2>/dev/null || true
@@ -811,10 +839,12 @@ uninstall_single_server() {
     # 3. 远程执行卸载
     local ssh_cmd=$(build_ssh_cmd "$server_ip" "$ssh_port" "$ssh_user" "$ssh_key")
     local remote_modules="$REMOTE_MODULES_DIR"
+    local RSUDO
+    RSUDO=$(remote_sudo_prefix "$ssh_user")
     
     print_info "[$server_alias] 开始远程卸载流程..."
     echo "----------------------------------------"
-    if $ssh_cmd "bash $remote_modules/uninstaller.sh" 2>&1 | sed "s/^/  [$server_alias] /"; then
+    if $ssh_cmd "${RSUDO}bash $remote_modules/uninstaller.sh" 2>&1 | sed "s/^/  [$server_alias] /"; then
         local uninstall_exit=0
     else
         local uninstall_exit=${PIPESTATUS[0]}

@@ -30,4 +30,4 @@ global:
     enable_bbr: true
     kernel_tuning: true
     
-  template: templates/vless-reality.json
+  template: templates/vless-ws.json

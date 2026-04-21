@@ -1,12 +1,14 @@
 # Aether-X
 
+**版本：0.9.1**
+
 下一代 Xray-core 自动化部署与多节点管理平台  
 支持实时健康监测、故障自愈、内核级优化的企业级代理解决方案
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-blue.svg)](https://www.linux.org/)
 [![Architecture](https://img.shields.io/badge/Arch-x86__64%20%7C%20ARM64-green.svg)](https://en.wikipedia.org/wiki/X86-64)
-[![Protocol](https://img.shields.io/badge/Protocol-REALITY%20%7C%20gRPC-orange.svg)](https://github.com/XTLS/REALITY)
+[![Protocol](https://img.shields.io/badge/Protocol-VLESS%20%7C%20WS%20%7C%20TLS-blue.svg)](https://github.com/XTLS/Xray-core)
 [![OS Support](https://img.shields.io/badge/OS-Ubuntu%20%7C%20Debian%20%7C%20CentOS-lightgrey.svg)](https://www.ubuntu.com/)
 
 ## 快速开始
@@ -28,7 +30,7 @@ cd aether-x
 | **多机编排** | 单机部署，需手动重复操作 | **Multi-Region Infrastructure Orchestration**<br/>支持跨云、跨区域的统一编排管理 |
 | **故障自愈** | 无健康监测，需人工排查 | **Real-time Health Self-healing**<br/>三维检测体系 + 自动故障隔离 + 智能订阅更新 |
 | **资源隔离** | 无资源限制，可能影响系统稳定性 | **Cgroups-based Resource Isolation**<br/>内存/CPU 硬限制，防止资源耗尽攻击 |
-| **配置管理** | 手动配置，易出错 | **Automated Configuration Generation**<br/>自动生成 UUID、密钥对、ShortID |
+| **配置管理** | 手动配置，易出错 | **Automated Configuration Generation**<br/>自动生成 UUID、WebSocket 路径、TLS 自签名证书 |
 | **订阅分发** | 手动维护订阅链接 | **Intelligent Subscription Management**<br/>基于健康状态的动态订阅生成 |
 | **系统优化** | 基础优化 | **Kernel-level Performance Tuning**<br/>BBR + TCP 参数优化 + Swap 管理 |
 
@@ -67,10 +69,7 @@ Aether-X 采用 Controller-Node 架构模式，通过 SSH 协议实现集中式�
 
 ### 隐私与安全
 
-- **REALITY 协议**：无指纹 TLS 流量伪装
-  - 自动生成 X25519 密钥对
-  - 随机选择 SNI 目标（如 `www.microsoft.com`）
-  - 支持 gRPC 传输，降低流量特征
+- **VLESS + WebSocket + TLS**：服务端使用 **OpenSSL 自签名证书**（证书 `CN` 与服务器 IP 一致），客户端需开启 **allowInsecure** 以校验通过；传输为普通 WebSocket over TLS，与 **Clash** 等客户端订阅格式一致
 - **Cgroups 资源硬限制**：防止资源耗尽攻击
   - 内存硬限制（OOM Killer 保护）
   - CPU 配额限制（防止 CPU 100%）
@@ -79,7 +78,7 @@ Aether-X 采用 Controller-Node 架构模式，通过 SSH 协议实现集中式�
 
 ### 其他核心功能
 
-- **自动配置生成** - VLESS + REALITY + gRPC，自动生成 UUID、密钥对、ShortID
+- **自动配置生成** - VLESS + WebSocket + TLS（自签名），自动生成 UUID、随机 WS 路径与证书
 - **多区域基础设施编排** - 通过 SSH 批量部署到多台服务器，支持并发部署
 - **环境自动检测** - 识别系统架构、发行版、云服务商，提供防火墙配置建议
 - **订阅链接管理** - 自动生成 Base64 编码的订阅文件，支持 S3/GitHub Pages/VPS 分发
@@ -102,13 +101,12 @@ aether-x/
 │   └── uninstaller.sh         # 卸载模块
 │
 ├── templates/                  # 配置模板
-│   ├── vless-reality.json     # VLESS + REALITY 模板
-│   └── vless-ws.json          # VLESS + WebSocket 模板
+│   └── vless-ws.json          # VLESS + WebSocket + TLS 参考模板（占位符）
 │
 ├── configs/                    # 配置文件
 │   ├── servers.yaml           # 服务器列表（用户配置）
 │   ├── servers.yaml.example   # 配置示例
-│   └── *.info                 # 节点配置信息（从服务端自动拉取，包含UUID、PublicKey等）
+│   └── *.info                 # 节点配置信息（从服务端自动拉取，含 UUID、WS Path、TLS SNI 等）
 │
 ├── dist/                       # 输出目录
 │   ├── sub_*.txt             # 生成的订阅文件（Base64编码）
@@ -218,18 +216,17 @@ servers:
 ### 批量部署流程
 
 1. **读取配置** - 解析 `configs/servers.yaml`
-2. **生成配置** - 为每台服务器自动生成 VLESS + REALITY 配置
+2. **生成配置** - 为每台服务器自动生成 VLESS + WebSocket + TLS 配置
    - 生成 UUID
-   - 生成 REALITY 密钥对（PrivateKey/PublicKey）
-   - 生成 ShortID
-   - 随机选择 SNI 目标
+   - 随机 WebSocket 路径
+   - 生成自签名 TLS 证书（`/etc/ssl/certs/xray.crt`，私钥 `/etc/ssl/private/xray.key`）
 3. **远程部署** - 对每台服务器执行（通过 SSH）：
    - 测试 SSH 连接
    - 上传并执行系统优化脚本
    - 安装 Xray-core 二进制
    - 创建配置目录和日志目录
    - 在服务端生成配置文件（`/usr/local/etc/xray/config.json`）
-   - 在服务端生成配置信息文件（`/usr/local/etc/xray/config.info`，包含UUID、PublicKey等）
+   - 在服务端生成配置信息文件（`/usr/local/etc/xray/config.info`，包含 UUID、WS Path、TLS SNI 等）
    - 创建 systemd 服务
    - 启动并验证服务
 4. **显示统计** - 输出部署结果和状态
@@ -253,7 +250,7 @@ servers:
    - **方法1**：从本地 `configs/*.info` 文件读取（如果存在）
    - **方法2**：从服务端拉取 info 文件到本地（`/usr/local/etc/xray/config.info` → `configs/{alias}.info`）
    - **方法3**：从远程服务器读取配置文件并解析（备用方案）
-3. **生成 VLESS URL** - 格式：`vless://uuid@ip:port?type=grpc&security=reality&...`
+3. **生成 VLESS URL** - 格式：`vless://uuid@ip:port?encryption=none&security=tls&type=ws&path=...&host=...&sni=...&allowInsecure=1#...`（与 Clash 等兼容）
 4. **Base64 编码** - 将所有 URL 编码为订阅格式
 5. **文件随机化** - 生成随机文件名（如 `sub_aad85773.txt`），同时保存原始 URL 文件（`.raw.txt`）
 6. **可选分发** - 上传到 S3/GitHub Pages/VPS
@@ -375,7 +372,7 @@ vim configs/servers.yaml
 2. **配置文件** - `.info` 文件包含敏感信息（UUID、密钥），不要提交到版本控制
 3. **防火墙** - 部署前配置安全组/防火墙规则，参考环境检测器的建议
 4. **订阅文件** - 订阅链接包含节点信息，请妥善保管，避免泄露
-5. **REALITY 协议** - 使用无指纹 TLS 伪装，降低流量特征识别风险
+5. **自签名 TLS** - 订阅链接中带 `allowInsecure=1`，请妥善保管订阅地址，避免中间人利用
 
 ## 故障排查
 
@@ -668,7 +665,6 @@ MIT License
 ## 致谢
 
 - [Xray-core](https://github.com/XTLS/Xray-core) - 核心代理引擎
-- [REALITY](https://github.com/XTLS/REALITY) - 无指纹 TLS 协议
 
 ## Star History
 
@@ -706,7 +702,7 @@ Aether-X 支持扩展新的协议模板。要添加新模板：
 1. **创建模板文件**：
    ```bash
    # 在 templates/ 目录下创建新模板
-   cp templates/vless-reality.json templates/your-protocol.json
+   cp templates/vless-ws.json templates/your-protocol.json
    ```
 
 2. **修改模板**：
